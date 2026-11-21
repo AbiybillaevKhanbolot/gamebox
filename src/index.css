@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Oswald', system-ui, sans-serif;
+    --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #EFE6D5;
+    color: #162328;
+    overflow-x: hidden;
+  }
+
+  h1, h2, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.bg-parchment-grid {
+  background-color: #EFE6D5;
+  background-image:
+    linear-gradient(to right, rgba(22, 35, 40, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(22, 35, 40, 0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.game-card {
+  background-color: #FAF6EE;
+  border: 2px solid #162328;
+  box-shadow: 4px 4px 0px #162328;
+}
+
+.game-btn {
+  border: 2px solid #162328;
+  box-shadow: 3px 3px 0px #162328;
+  transition: transform 90ms ease, box-shadow 90ms ease, background-color 120ms ease;
+}
+
+.game-btn:hover:not(:disabled) {
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0px #162328;
+}
+
+.game-btn:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0px #162328;
+}
