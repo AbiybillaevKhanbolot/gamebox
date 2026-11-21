@@ -25,6 +25,7 @@ interface GameScreenProps {
   playerId: string | null;
   liveTickRef: React.MutableRefObject<LiveTickData | null>;
   prevTickRef: React.MutableRefObject<LiveTickData | null>;
+  tickBufferRef: React.MutableRefObject<LiveTickData[]>;
   effectsRef: React.MutableRefObject<VisualEffect[]>;
   localInputRef: React.MutableRefObject<{ dx: number; dy: number }>;
   hudStats: {
@@ -66,6 +67,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({
   playerId,
   liveTickRef,
   prevTickRef,
+  tickBufferRef,
   effectsRef,
   localInputRef,
   hudStats,
@@ -355,9 +357,11 @@ export const GameScreen: React.FC<GameScreenProps> = ({
               phase={roomState.phase}
               playerId={playerId}
               myRole={myRole}
+              isHost={isHost}
               visibilityMode={roomState.settings.visibilityMode}
               liveTickRef={liveTickRef}
               prevTickRef={prevTickRef}
+              tickBufferRef={tickBufferRef}
               effectsRef={effectsRef}
               localInputRef={localInputRef}
               onPingCell={onPingCell}

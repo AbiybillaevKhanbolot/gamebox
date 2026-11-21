@@ -11,6 +11,7 @@ export default function App() {
     clearError,
     liveTickRef,
     prevTickRef,
+    tickBufferRef,
     effectsRef,
     localInputRef,
     hudStats,
@@ -50,6 +51,7 @@ export default function App() {
       playerId={playerId}
       liveTickRef={liveTickRef}
       prevTickRef={prevTickRef}
+      tickBufferRef={tickBufferRef}
       effectsRef={effectsRef}
       localInputRef={localInputRef}
       hudStats={hudStats}

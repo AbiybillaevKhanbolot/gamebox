@@ -21,9 +21,11 @@ interface MazeCanvasProps {
   phase: GamePhase;
   playerId: string | null;
   myRole: PlayerRole;
+  isHost: boolean;
   visibilityMode: VisibilityMode;
   liveTickRef: React.MutableRefObject<LiveTickData | null>;
   prevTickRef: React.MutableRefObject<LiveTickData | null>;
+  tickBufferRef: React.MutableRefObject<LiveTickData[]>;
   effectsRef: React.MutableRefObject<VisualEffect[]>;
   localInputRef: React.MutableRefObject<{ dx: number; dy: number }>;
   onPingCell: (x: number, y: number) => void;
@@ -151,8 +153,10 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
   phase,
   playerId,
   myRole,
+  isHost,
   visibilityMode,
   liveTickRef,
+  tickBufferRef,
   effectsRef,
   localInputRef,
   onPingCell,
@@ -164,9 +168,11 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
   const floatingRef = useRef<FloatingBanner[]>([]);
   const seenEffectsRef = useRef<Set<string>>(new Set());
   const shakeRef = useRef<number>(0);
+  const clockOffsetRef = useRef<number | null>(null);
+  const lastSeenServerTRef = useRef<number>(-1);
 
-  const propsRef = useRef({ phase, playerId, myRole, visibilityMode });
-  propsRef.current = { phase, playerId, myRole, visibilityMode };
+  const propsRef = useRef({ phase, playerId, myRole, isHost, visibilityMode });
+  propsRef.current = { phase, playerId, myRole, isHost, visibilityMode };
 
   const layoutRef = useRef<{
     offsetX: number;
@@ -182,6 +188,8 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
     floatingRef.current = [];
     seenEffectsRef.current.clear();
     shakeRef.current = 0;
+    clockOffsetRef.current = null;
+    lastSeenServerTRef.current = -1;
   }, [maze]);
 
   useEffect(() => {
@@ -251,6 +259,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         phase: curPhase,
         playerId: curPlayerId,
         myRole: curMyRole,
+        isHost: curIsHost,
         visibilityMode: curVisMode,
       } = propsRef.current;
       const { offsetX, offsetY, cellSize, viewW, viewH, dpr } = layoutRef.current;
@@ -603,10 +612,55 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         return 0;
       });
 
-      const elapsedSinceTick = tick
-        ? Math.min(0.14, Math.max(0, (now - tick.t) / 1000))
+      const buf = tickBufferRef.current;
+      const latestSnap = buf[buf.length - 1] ?? tick;
+      if (latestSnap && latestSnap.serverT !== lastSeenServerTRef.current) {
+        lastSeenServerTRef.current = latestSnap.serverT;
+        const sampleOffset = latestSnap.t - latestSnap.serverT;
+        if (
+          clockOffsetRef.current === null ||
+          Math.abs(sampleOffset - clockOffsetRef.current) > 800
+        ) {
+          clockOffsetRef.current = sampleOffset;
+        } else if (sampleOffset < clockOffsetRef.current) {
+          clockOffsetRef.current += (sampleOffset - clockOffsetRef.current) * 0.35;
+        } else {
+          clockOffsetRef.current += (sampleOffset - clockOffsetRef.current) * 0.04;
+        }
+      }
+
+      const interpDelay = curIsHost ? 32 : 105;
+      const renderServerT =
+        clockOffsetRef.current !== null
+          ? now - clockOffsetRef.current - interpDelay
+          : latestSnap?.serverT ?? 0;
+
+      let snapA: LiveTickData | null = null;
+      let snapB: LiveTickData | null = null;
+      let interpU = 0;
+
+      if (buf.length >= 2 && latestSnap) {
+        if (renderServerT <= buf[0].serverT) {
+          snapA = buf[0];
+          snapB = buf[0];
+          interpU = 0;
+        } else if (renderServerT <= latestSnap.serverT) {
+          for (let i = buf.length - 2; i >= 0; i--) {
+            if (buf[i].serverT <= renderServerT) {
+              snapA = buf[i];
+              snapB = buf[i + 1];
+              const span = Math.max(1, snapB.serverT - snapA.serverT);
+              interpU = Math.max(0, Math.min(1, (renderServerT - snapA.serverT) / span));
+              break;
+            }
+          }
+        }
+      }
+
+      const elapsedSinceTick = latestSnap
+        ? Math.min(0.18, Math.max(0, (now - latestSnap.t) / 1000))
         : 0;
-      const huntersLocked = (tick?.huntersReleaseIn ?? 0) > 0;
+      const huntersLocked = (latestSnap?.huntersReleaseIn ?? 0) > 0;
       let mySmoothedPos: { x: number; y: number } | null = null;
 
       for (const p of sortedPlayers) {
@@ -628,7 +682,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
           // Local client-side prediction + gentle server reconciliation
           const jump = Math.hypot(p.x - sm.x, p.y - sm.y);
           if (jump > 2.2) {
-            // Portal warp or respawn
             sm.x = p.x;
             sm.y = p.y;
             sm.trail = [];
@@ -650,7 +703,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
               sm.y += sm.vy * dt;
               resolveMazeCollisions(sm, maze);
 
-              // Gentle drift correction toward host-predicted point
               const serverPred = {
                 x: p.x + p.vx * elapsedSinceTick,
                 y: p.y + p.vy * elapsedSinceTick,
@@ -678,30 +730,59 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
             sm.walkPhase += dt * spd * 3.4;
           }
         } else {
-          // Remote player: wall-aware velocity extrapolation + smooth blending
-          const jump = Math.hypot(p.x - sm.x, p.y - sm.y);
-          if (jump > 2.5) {
-            sm.x = p.x;
-            sm.y = p.y;
-            sm.trail = [];
-          } else {
-            const targetPos = {
-              x: p.x + p.vx * elapsedSinceTick,
-              y: p.y + p.vy * elapsedSinceTick,
+          // Remote player / enemy: buffered snapshot interpolation over serverT timeline
+          let targetX = p.x;
+          let targetY = p.y;
+          let targetVx = p.vx;
+          let targetVy = p.vy;
+
+          if (snapA && snapB) {
+            const pA = snapA.players.find((q) => q.id === p.id);
+            const pB = snapB.players.find((q) => q.id === p.id);
+            if (pA && pB && Math.hypot(pB.x - pA.x, pB.y - pA.y) <= 2.2) {
+              targetX = pA.x + (pB.x - pA.x) * interpU;
+              targetY = pA.y + (pB.y - pA.y) * interpU;
+              targetVx = pA.vx + (pB.vx - pA.vx) * interpU;
+              targetVy = pA.vy + (pB.vy - pA.vy) * interpU;
+            } else if (pB) {
+              targetX = pB.x;
+              targetY = pB.y;
+              targetVx = pB.vx;
+              targetVy = pB.vy;
+            }
+          } else if (latestSnap) {
+            // Temporary packet gap beyond interpDelay: smooth wall-aware extrapolation
+            const extraDt = Math.min(
+              0.18,
+              Math.max(0, (renderServerT - latestSnap.serverT) / 1000)
+            );
+            const extPos = {
+              x: p.x + p.vx * extraDt,
+              y: p.y + p.vy * extraDt,
             };
             if (Math.abs(p.vx) > 0.01 || Math.abs(p.vy) > 0.01) {
-              resolveMazeCollisions(targetPos, maze);
+              resolveMazeCollisions(extPos, maze);
             }
-            const blend = 1 - Math.exp(-15 * dt);
-            sm.x += (targetPos.x - sm.x) * blend;
-            sm.y += (targetPos.y - sm.y) * blend;
+            targetX = extPos.x;
+            targetY = extPos.y;
           }
-          sm.vx = p.vx;
-          sm.vy = p.vy;
-          const spd = Math.hypot(p.vx, p.vy);
+
+          const jump = Math.hypot(targetX - sm.x, targetY - sm.y);
+          if (jump > 2.2) {
+            sm.x = targetX;
+            sm.y = targetY;
+            sm.trail = [];
+          } else {
+            const follow = 1 - Math.exp(-30 * dt);
+            sm.x += (targetX - sm.x) * follow;
+            sm.y += (targetY - sm.y) * follow;
+          }
+          sm.vx = targetVx;
+          sm.vy = targetVy;
+          const spd = Math.hypot(sm.vx, sm.vy);
           if (spd > 0.2) {
-            sm.facingX = p.vx / spd;
-            sm.facingY = p.vy / spd;
+            sm.facingX = sm.vx / spd;
+            sm.facingY = sm.vy / spd;
             sm.walkPhase += dt * spd * 3.4;
           }
         }
@@ -929,7 +1010,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       cancelAnimationFrame(animId);
       ro.disconnect();
     };
-  }, [maze, liveTickRef, effectsRef, localInputRef]);
+  }, [maze, liveTickRef, tickBufferRef, effectsRef, localInputRef]);
 
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (myRole !== 'hunter') return;

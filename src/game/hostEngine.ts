@@ -118,7 +118,8 @@ export class HostGameEngine {
   private tickInterval: ReturnType<typeof setInterval>;
   private pruneInterval: ReturnType<typeof setInterval>;
   private lastStepTime = performance.now();
-  private lastEmitTime = 0;
+  private simClockMs = 0;
+  private stepCounter = 0;
   private pendingEvents: GameEvent[] = [];
 
   constructor(
@@ -177,9 +178,10 @@ export class HostGameEngine {
       const dt = Math.min(0.08, Math.max(0.005, (now - this.lastStepTime) / 1000));
       this.lastStepTime = now;
       if (this.phase === 'COUNTDOWN' || this.phase === 'PLAYING') {
+        this.simClockMs += dt * 1000;
         this.step(dt);
       }
-    }, 1000 / 30);
+    }, 25);
 
     this.pruneInterval = setInterval(() => {
       const now = Date.now();
@@ -609,7 +611,7 @@ export class HostGameEngine {
     this.weaponSpawnTimer = 11.0;
     this.echoTimer = 9.0;
     this.pendingEvents = [];
-    this.lastEmitTime = 0;
+    this.stepCounter = 0;
     this.pickups = this.spawnInitialPickups(maze);
     this.lastStepTime = performance.now();
 
@@ -1000,10 +1002,9 @@ export class HostGameEngine {
   private emitTick(events: GameEvent[]): void {
     const connectedAlive = this.players.filter((p) => p.connected && p.alive);
     const tickPlayers = connectedAlive.map((p) => this.toTickState(p));
-    const nowMs = Date.now();
     const baseTick = {
       type: 'tick' as const,
-      t: nowMs,
+      t: Math.round(this.simClockMs),
       phase: this.phase,
       timeLeft: Math.round(this.timeLeft * 10) / 10,
       countdown: Math.round(this.countdown * 10) / 10,
@@ -1014,18 +1015,17 @@ export class HostGameEngine {
       echoes: this.echoes,
     };
 
-    // Host always receives full 30 Hz ticks locally
+    // Host receives full 40 Hz ticks locally
     this.transport.onHostMessage({ ...baseTick, events });
 
-    // Guests receive ~20 Hz over MQTT (plus instant flush on events)
+    // Guests receive steady 20 Hz over MQTT (every 2nd step, or immediately on events)
     if (events.length > 0) {
       this.pendingEvents.push(...events);
     }
-    const nowPerf = performance.now();
-    if (this.pendingEvents.length === 0 && nowPerf - this.lastEmitTime < 48) {
+    this.stepCounter += 1;
+    if (this.pendingEvents.length === 0 && this.stepCounter % 2 !== 0) {
       return;
     }
-    this.lastEmitTime = nowPerf;
     const flushedEvents = this.pendingEvents;
     this.pendingEvents = [];
 

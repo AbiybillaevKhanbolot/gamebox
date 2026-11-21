@@ -17,6 +17,7 @@ import { soundFX } from '../utils/sound.ts';
 
 export interface LiveTickData {
   t: number;
+  serverT: number;
   timeLeft: number;
   countdown: number;
   huntersReleaseIn: number;
@@ -96,6 +97,7 @@ export function useGameSocket() {
 
   const liveTickRef = useRef<LiveTickData | null>(null);
   const prevTickRef = useRef<LiveTickData | null>(null);
+  const tickBufferRef = useRef<LiveTickData[]>([]);
   const effectsRef = useRef<VisualEffect[]>([]);
   const localInputRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
 
@@ -223,6 +225,7 @@ export function useGameSocket() {
           if (msg.state.phase === 'COUNTDOWN' || msg.state.phase === 'LOBBY') {
             prevTickRef.current = null;
             liveTickRef.current = null;
+            tickBufferRef.current = [];
             effectsRef.current = [];
           }
           const meInState = msg.state.players.find(
@@ -241,9 +244,14 @@ export function useGameSocket() {
         }
 
         case 'tick': {
-          prevTickRef.current = liveTickRef.current;
-          liveTickRef.current = {
+          const buf = tickBufferRef.current;
+          const lastSnap = buf[buf.length - 1];
+          if (lastSnap && msg.t < lastSnap.serverT) {
+            break;
+          }
+          const snap: LiveTickData = {
             t: performance.now(),
+            serverT: msg.t,
             timeLeft: msg.timeLeft,
             countdown: msg.countdown,
             huntersReleaseIn: msg.huntersReleaseIn,
@@ -252,6 +260,12 @@ export function useGameSocket() {
             pings: msg.pings,
             echoes: msg.echoes,
           };
+          prevTickRef.current = liveTickRef.current;
+          liveTickRef.current = snap;
+          buf.push(snap);
+          if (buf.length > 16) {
+            buf.shift();
+          }
 
           if (msg.phase) {
             setRoomState((prev) => {
@@ -769,6 +783,7 @@ export function useGameSocket() {
     clearError: () => setError(null),
     liveTickRef,
     prevTickRef,
+    tickBufferRef,
     effectsRef,
     localInputRef,
     hudStats,
