@@ -198,6 +198,7 @@ export type ServerMessage =
   | {
       type: 'tick';
       t: number;
+      phase: GamePhase;
       timeLeft: number;
       countdown: number;
       huntersReleaseIn: number;
@@ -223,6 +224,12 @@ export type ServerMessage =
 export const MAX_PLAYERS_PER_ROOM = 10;
 export const HERO_VISION_RADIUS = 6.8;
 export const HUNTER_VISION_RADIUS = 6.2;
+
+export const PLAYER_RADIUS = 0.27;
+export const HERO_BASE_SPEED = 4.6;
+export const HUNTER_BASE_SPEED = 4.0;
+export const HERO_DASH_MULT = 1.72;
+export const HUNTER_DASH_MULT = 1.62;
 
 export const PLAYER_COLORS = [
   '#38BDF8', // sky

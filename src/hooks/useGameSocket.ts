@@ -97,6 +97,7 @@ export function useGameSocket() {
   const liveTickRef = useRef<LiveTickData | null>(null);
   const prevTickRef = useRef<LiveTickData | null>(null);
   const effectsRef = useRef<VisualEffect[]>([]);
+  const localInputRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
 
   const [hudStats, setHudStats] = useState<{
     timeLeft: number;
@@ -252,20 +253,56 @@ export function useGameSocket() {
             echoes: msg.echoes,
           };
 
+          if (msg.phase) {
+            setRoomState((prev) => {
+              if (!prev || prev.phase === msg.phase) return prev;
+              return { ...prev, phase: msg.phase };
+            });
+          }
+
           const me = msg.players.find((p) => p.id === playerIdRef.current);
-          setHudStats((prev) => ({
-            timeLeft: msg.timeLeft,
-            countdown: msg.countdown,
-            huntersReleaseIn: msg.huntersReleaseIn,
-            myLives: me ? me.lives : 0,
-            myMaxLives: me ? me.maxLives : prev.myMaxLives,
-            myAlive: me ? me.alive : false,
-            myWeaponCharges: me ? me.weaponCharges : 0,
-            myDashCooldown: me?.dashCooldown ?? 0,
-            myDashMaxCooldown: me?.dashMaxCooldown ?? 5,
-            mySpeedBoost: me?.speedBoost ?? 0,
-            myStunTimer: me?.stunTimer ?? 0,
-          }));
+          const nextTimeLeft = Math.max(0, Math.ceil(msg.timeLeft));
+          const nextCountdown = Math.max(0, Math.ceil(msg.countdown));
+          const nextHuntersRelease = Math.max(0, Math.round(msg.huntersReleaseIn * 10) / 10);
+          const nextLives = me ? me.lives : 0;
+          const nextAlive = me ? me.alive : false;
+          const nextWeaponCharges = me ? me.weaponCharges : 0;
+          const nextDashCd = Math.round((me?.dashCooldown ?? 0) * 10) / 10;
+          const nextSpeedBoost = Math.round((me?.speedBoost ?? 0) * 10) / 10;
+          const nextStun = Math.round((me?.stunTimer ?? 0) * 10) / 10;
+
+          setHudStats((prev) => {
+            const nextMaxLives = me ? me.maxLives : prev.myMaxLives;
+            const nextDashMax = me?.dashMaxCooldown ?? prev.myDashMaxCooldown;
+            if (
+              Math.ceil(prev.timeLeft) === nextTimeLeft &&
+              Math.max(0, Math.ceil(prev.countdown)) === nextCountdown &&
+              prev.huntersReleaseIn === nextHuntersRelease &&
+              prev.myLives === nextLives &&
+              prev.myMaxLives === nextMaxLives &&
+              prev.myAlive === nextAlive &&
+              prev.myWeaponCharges === nextWeaponCharges &&
+              prev.myDashCooldown === nextDashCd &&
+              prev.myDashMaxCooldown === nextDashMax &&
+              prev.mySpeedBoost === nextSpeedBoost &&
+              prev.myStunTimer === nextStun
+            ) {
+              return prev;
+            }
+            return {
+              timeLeft: nextTimeLeft,
+              countdown: nextCountdown,
+              huntersReleaseIn: nextHuntersRelease,
+              myLives: nextLives,
+              myMaxLives: nextMaxLives,
+              myAlive: nextAlive,
+              myWeaponCharges: nextWeaponCharges,
+              myDashCooldown: nextDashCd,
+              myDashMaxCooldown: nextDashMax,
+              mySpeedBoost: nextSpeedBoost,
+              myStunTimer: nextStun,
+            };
+          });
 
           if (msg.events.length > 0) {
             const now = performance.now();
@@ -339,6 +376,14 @@ export function useGameSocket() {
   );
 
   const sendAction = useCallback((msg: ClientMessage) => {
+    if (msg.type === 'input') {
+      const len = Math.hypot(msg.dx, msg.dy);
+      localInputRef.current =
+        len > 0.01
+          ? { dx: msg.dx / Math.max(1, len), dy: msg.dy / Math.max(1, len) }
+          : { dx: 0, dy: 0 };
+    }
+
     if (hostEngineRef.current) {
       hostEngineRef.current.handleHostAction(msg);
       return;
@@ -356,7 +401,8 @@ export function useGameSocket() {
       const prevZero = prev.dx === 0 && prev.dy === 0;
       if (!msg.dash && !msg.attack) {
         if (isZero && prevZero) return;
-        if (msg.dx === prev.dx && msg.dy === prev.dy && now - prev.at < 90) {
+        // Host preserves inputDx/inputDy until changed; refresh at 4 Hz while holding
+        if (msg.dx === prev.dx && msg.dy === prev.dy && now - prev.at < 240) {
           return;
         }
       }
@@ -724,6 +770,7 @@ export function useGameSocket() {
     liveTickRef,
     prevTickRef,
     effectsRef,
+    localInputRef,
     hudStats,
     createRoom,
     joinRoom,

@@ -17,10 +17,15 @@ import type {
   TacticalPing,
 } from '../../shared/types.ts';
 import {
+  HERO_BASE_SPEED,
+  HERO_DASH_MULT,
+  HUNTER_BASE_SPEED,
+  HUNTER_DASH_MULT,
   MAX_PLAYERS_PER_ROOM,
   PLAYER_COLORS,
 } from '../../shared/types.ts';
 import { generateMaze } from './mazeGenerator.ts';
+import { resolveMazeCollisions } from './physics.ts';
 
 export interface HostTransport {
   onHostMessage: (msg: ServerMessage) => void;
@@ -61,11 +66,6 @@ interface InternalPlayer {
   lastSeenAt: number;
 }
 
-const PLAYER_RADIUS = 0.27;
-const HERO_BASE_SPEED = 4.6;
-const HUNTER_BASE_SPEED = 4.0;
-const HERO_DASH_MULT = 1.72;
-const HUNTER_DASH_MULT = 1.62;
 const HERO_DASH_DURATION = 0.65;
 const HUNTER_DASH_DURATION = 0.55;
 const HERO_DASH_COOLDOWN = 5.0;
@@ -681,6 +681,7 @@ export class HostGameEngine {
         this.countdown = 0;
         this.phase = 'PLAYING';
         events.push({ type: 'round_start' });
+        this.broadcastRoomState();
       }
       this.emitTick(events);
       return;
@@ -823,7 +824,7 @@ export class HostGameEngine {
       if (Math.abs(targetVx) > 0.001 || Math.abs(targetVy) > 0.001) {
         p.x += targetVx * dt;
         p.y += targetVy * dt;
-        this.resolveMazeCollisions(p, maze);
+        resolveMazeCollisions(p, maze);
       }
 
       if (maze.portals && p.portalCooldown <= 0) {
@@ -972,39 +973,6 @@ export class HostGameEngine {
     this.addSystemChat(`Герой ${hero.name} поверг стража ${guard.name}!`);
   }
 
-  private resolveMazeCollisions(p: InternalPlayer, maze: MazeData): void {
-    const { cols, rows, cells } = maze;
-    for (let iter = 0; iter < 2; iter++) {
-      const minCx = Math.max(0, Math.floor(p.x - PLAYER_RADIUS - 0.1));
-      const maxCx = Math.min(cols - 1, Math.floor(p.x + PLAYER_RADIUS + 0.1));
-      const minCy = Math.max(0, Math.floor(p.y - PLAYER_RADIUS - 0.1));
-      const maxCy = Math.min(rows - 1, Math.floor(p.y + PLAYER_RADIUS + 0.1));
-
-      for (let cy = minCy; cy <= maxCy; cy++) {
-        for (let cx = minCx; cx <= maxCx; cx++) {
-          if (cells[cy * cols + cx] !== 1) continue;
-
-          const closestX = Math.max(cx, Math.min(p.x, cx + 1));
-          const closestY = Math.max(cy, Math.min(p.y, cy + 1));
-          const dx = p.x - closestX;
-          const dy = p.y - closestY;
-          const distSq = dx * dx + dy * dy;
-
-          if (distSq < PLAYER_RADIUS * PLAYER_RADIUS) {
-            const dist = Math.sqrt(distSq);
-            if (dist > 0.0001) {
-              const overlap = PLAYER_RADIUS - dist;
-              p.x += (dx / dist) * overlap;
-              p.y += (dy / dist) * overlap;
-            } else {
-              p.x += PLAYER_RADIUS;
-            }
-          }
-        }
-      }
-    }
-  }
-
   private toTickState(p: InternalPlayer): PlayerTickState {
     return {
       id: p.id,
@@ -1030,11 +998,30 @@ export class HostGameEngine {
   }
 
   private emitTick(events: GameEvent[]): void {
+    const connectedAlive = this.players.filter((p) => p.connected && p.alive);
+    const tickPlayers = connectedAlive.map((p) => this.toTickState(p));
+    const nowMs = Date.now();
+    const baseTick = {
+      type: 'tick' as const,
+      t: nowMs,
+      phase: this.phase,
+      timeLeft: Math.round(this.timeLeft * 10) / 10,
+      countdown: Math.round(this.countdown * 10) / 10,
+      huntersReleaseIn: Math.round(this.huntersReleaseIn * 10) / 10,
+      players: tickPlayers,
+      pickups: this.pickups,
+      pings: this.pings,
+      echoes: this.echoes,
+    };
+
+    // Host always receives full 30 Hz ticks locally
+    this.transport.onHostMessage({ ...baseTick, events });
+
+    // Guests receive ~20 Hz over MQTT (plus instant flush on events)
     if (events.length > 0) {
       this.pendingEvents.push(...events);
     }
     const nowPerf = performance.now();
-    // Broadcast over MQTT at ~20 Hz (50ms) unless urgent game events just fired
     if (this.pendingEvents.length === 0 && nowPerf - this.lastEmitTime < 48) {
       return;
     }
@@ -1042,22 +1029,7 @@ export class HostGameEngine {
     const flushedEvents = this.pendingEvents;
     this.pendingEvents = [];
 
-    const connectedAlive = this.players.filter((p) => p.connected && p.alive);
-    const payload: ServerMessage = {
-      type: 'tick',
-      t: Date.now(),
-      timeLeft: Math.round(this.timeLeft * 10) / 10,
-      countdown: Math.round(this.countdown * 10) / 10,
-      huntersReleaseIn: Math.round(this.huntersReleaseIn * 10) / 10,
-      players: connectedAlive.map((p) => this.toTickState(p)),
-      pickups: this.pickups,
-      pings: this.pings,
-      echoes: this.echoes,
-      events: flushedEvents,
-    };
-
-    this.transport.onHostMessage(payload);
-    this.transport.onBroadcast(payload);
+    this.transport.onBroadcast({ ...baseTick, events: flushedEvents });
   }
 
   private finishRound(

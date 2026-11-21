@@ -12,6 +12,7 @@ export default function App() {
     liveTickRef,
     prevTickRef,
     effectsRef,
+    localInputRef,
     hudStats,
     createRoom,
     joinRoom,
@@ -50,6 +51,7 @@ export default function App() {
       liveTickRef={liveTickRef}
       prevTickRef={prevTickRef}
       effectsRef={effectsRef}
+      localInputRef={localInputRef}
       hudStats={hudStats}
       onSendInput={sendInput}
       onPingCell={sendPing}

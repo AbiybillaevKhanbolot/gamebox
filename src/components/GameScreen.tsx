@@ -26,6 +26,7 @@ interface GameScreenProps {
   liveTickRef: React.MutableRefObject<LiveTickData | null>;
   prevTickRef: React.MutableRefObject<LiveTickData | null>;
   effectsRef: React.MutableRefObject<VisualEffect[]>;
+  localInputRef: React.MutableRefObject<{ dx: number; dy: number }>;
   hudStats: {
     timeLeft: number;
     countdown: number;
@@ -66,6 +67,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({
   liveTickRef,
   prevTickRef,
   effectsRef,
+  localInputRef,
   hudStats,
   onSendInput,
   onPingCell,
@@ -169,7 +171,12 @@ export const GameScreen: React.FC<GameScreenProps> = ({
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
 
-    const interval = setInterval(emitCurrentInput, 66);
+    const interval = setInterval(() => {
+      const { dx, dy } = computeVector();
+      if (dx !== 0 || dy !== 0) {
+        emitCurrentInput();
+      }
+    }, 220);
 
     return () => {
       window.removeEventListener('keydown', onKeyDown);
@@ -215,7 +222,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({
   const dashReady = hudStats.myDashCooldown <= 0.05;
 
   return (
-    <div className="h-screen w-screen bg-[#132227] text-[#FAF6EE] flex flex-col overflow-hidden">
+    <div className="h-[100dvh] w-screen bg-[#132227] text-[#FAF6EE] flex flex-col overflow-hidden">
       {/* Carved Stone Top HUD */}
       <header className="w-full border-b-2 border-[#0B1417] bg-[#1B3139] px-4 sm:px-6 py-2.5 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-4 min-w-0">
@@ -352,12 +359,13 @@ export const GameScreen: React.FC<GameScreenProps> = ({
               liveTickRef={liveTickRef}
               prevTickRef={prevTickRef}
               effectsRef={effectsRef}
+              localInputRef={localInputRef}
               onPingCell={onPingCell}
             />
           )}
 
           {/* Countdown Overlay */}
-          {roomState.phase === 'COUNTDOWN' && (
+          {roomState.phase === 'COUNTDOWN' && hudStats.countdown > 0 && (
             <div className="absolute inset-0 bg-[#0B1417]/65 flex items-center justify-center pointer-events-none p-4">
               <div className="game-card rounded-xl px-8 py-6 text-center max-w-md text-[#162328]">
                 <div className="text-xs font-bold text-[#475569] mb-1">
@@ -411,86 +419,84 @@ export const GameScreen: React.FC<GameScreenProps> = ({
 
           {/* Touch Controls for Mobile / Tablet */}
           {roomState.phase === 'PLAYING' && hudStats.myAlive && (
-            <div className="lg:hidden absolute bottom-3 inset-x-3 flex items-end justify-between pointer-events-none">
-              <div className="grid grid-cols-3 gap-1.5 pointer-events-auto bg-[#FAF6EE]/95 p-1.5 rounded-xl border-2 border-[#162328]">
+            <div className="lg:hidden absolute bottom-3 inset-x-3 flex items-end justify-between pointer-events-none touch-none select-none">
+              <div className="grid grid-cols-3 gap-1.5 pointer-events-auto bg-[#FAF6EE]/95 p-1.5 rounded-xl border-2 border-[#162328] touch-none">
                 <div />
                 <button
                   type="button"
-                  onTouchStart={(e) => {
+                  onPointerDown={(e) => {
                     e.preventDefault();
                     handleTouchMove(0, -1);
                   }}
-                  onTouchEnd={() => handleTouchMove(0, 0)}
-                  onMouseDown={() => handleTouchMove(0, -1)}
-                  onMouseUp={() => handleTouchMove(0, 0)}
-                  className="w-11 h-11 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center"
+                  onPointerUp={() => handleTouchMove(0, 0)}
+                  onPointerCancel={() => handleTouchMove(0, 0)}
+                  onPointerLeave={() => handleTouchMove(0, 0)}
+                  className="w-12 h-12 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center touch-none"
                 >
                   <ArrowUp className="w-5 h-5" />
                 </button>
                 <div />
                 <button
                   type="button"
-                  onTouchStart={(e) => {
+                  onPointerDown={(e) => {
                     e.preventDefault();
                     handleTouchMove(-1, 0);
                   }}
-                  onTouchEnd={() => handleTouchMove(0, 0)}
-                  onMouseDown={() => handleTouchMove(-1, 0)}
-                  onMouseUp={() => handleTouchMove(0, 0)}
-                  className="w-11 h-11 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center"
+                  onPointerUp={() => handleTouchMove(0, 0)}
+                  onPointerCancel={() => handleTouchMove(0, 0)}
+                  onPointerLeave={() => handleTouchMove(0, 0)}
+                  className="w-12 h-12 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center touch-none"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
                 <button
                   type="button"
-                  onTouchStart={(e) => {
+                  onPointerDown={(e) => {
                     e.preventDefault();
                     handleTouchMove(0, 1);
                   }}
-                  onTouchEnd={() => handleTouchMove(0, 0)}
-                  onMouseDown={() => handleTouchMove(0, 1)}
-                  onMouseUp={() => handleTouchMove(0, 0)}
-                  className="w-11 h-11 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center"
+                  onPointerUp={() => handleTouchMove(0, 0)}
+                  onPointerCancel={() => handleTouchMove(0, 0)}
+                  onPointerLeave={() => handleTouchMove(0, 0)}
+                  className="w-12 h-12 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center touch-none"
                 >
                   <ArrowDown className="w-5 h-5" />
                 </button>
                 <button
                   type="button"
-                  onTouchStart={(e) => {
+                  onPointerDown={(e) => {
                     e.preventDefault();
                     handleTouchMove(1, 0);
                   }}
-                  onTouchEnd={() => handleTouchMove(0, 0)}
-                  onMouseDown={() => handleTouchMove(1, 0)}
-                  onMouseUp={() => handleTouchMove(0, 0)}
-                  className="w-11 h-11 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center"
+                  onPointerUp={() => handleTouchMove(0, 0)}
+                  onPointerCancel={() => handleTouchMove(0, 0)}
+                  onPointerLeave={() => handleTouchMove(0, 0)}
+                  className="w-12 h-12 rounded-lg bg-[#E5DAC6] active:bg-[#F59E0B] text-[#162328] border border-[#162328] flex items-center justify-center touch-none"
                 >
                   <ArrowRight className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="flex flex-col gap-2 pointer-events-auto">
+              <div className="flex flex-col gap-2 pointer-events-auto touch-none">
                 {myRole === 'hero' && hudStats.myWeaponCharges > 0 && (
                   <button
                     type="button"
-                    onTouchStart={(e) => {
+                    onPointerDown={(e) => {
                       e.preventDefault();
                       handleTouchAttack();
                     }}
-                    onClick={handleTouchAttack}
-                    className="game-btn h-12 px-4 rounded-xl font-extrabold text-sm bg-[#EF4444] text-white"
+                    className="game-btn h-12 px-4 rounded-xl font-extrabold text-sm bg-[#EF4444] text-white touch-none"
                   >
                     ⚔ Удар
                   </button>
                 )}
                 <button
                   type="button"
-                  onTouchStart={(e) => {
+                  onPointerDown={(e) => {
                     e.preventDefault();
                     handleTouchDash();
                   }}
-                  onClick={handleTouchDash}
-                  className={`game-btn h-14 px-5 rounded-xl font-extrabold text-sm ${
+                  className={`game-btn h-14 px-5 rounded-xl font-extrabold text-sm touch-none ${
                     dashReady
                       ? 'bg-[#F59E0B] text-[#162328]'
                       : 'bg-[#E5DAC6] text-[#64748B]'

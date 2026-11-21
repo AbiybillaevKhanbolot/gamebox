@@ -6,9 +6,14 @@ import type {
   VisibilityMode,
 } from '../../shared/types.ts';
 import {
+  HERO_BASE_SPEED,
+  HERO_DASH_MULT,
   HERO_VISION_RADIUS,
+  HUNTER_BASE_SPEED,
+  HUNTER_DASH_MULT,
   HUNTER_VISION_RADIUS,
 } from '../../shared/types.ts';
+import { resolveMazeCollisions } from '../game/physics.ts';
 import type { LiveTickData, VisualEffect } from '../hooks/useGameSocket.ts';
 
 interface MazeCanvasProps {
@@ -20,6 +25,7 @@ interface MazeCanvasProps {
   liveTickRef: React.MutableRefObject<LiveTickData | null>;
   prevTickRef: React.MutableRefObject<LiveTickData | null>;
   effectsRef: React.MutableRefObject<VisualEffect[]>;
+  localInputRef: React.MutableRefObject<{ dx: number; dy: number }>;
   onPingCell: (x: number, y: number) => void;
 }
 
@@ -43,6 +49,103 @@ interface FloatingBanner {
   createdAt: number;
 }
 
+function buildStaticMazeCache(
+  maze: MazeData,
+  viewW: number,
+  viewH: number,
+  dpr: number,
+  offsetX: number,
+  offsetY: number,
+  cellSize: number
+): HTMLCanvasElement {
+  const cache = document.createElement('canvas');
+  cache.width = Math.max(1, Math.round(viewW * dpr));
+  cache.height = Math.max(1, Math.round(viewH * dpr));
+  const ctx = cache.getContext('2d');
+  if (!ctx) return cache;
+
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = '#132227';
+  ctx.fillRect(0, 0, viewW, viewH);
+
+  const boardW = cellSize * maze.cols;
+  const boardH = cellSize * maze.rows;
+
+  ctx.fillStyle = '#0B1417';
+  ctx.fillRect(offsetX - 4, offsetY - 4, boardW + 8, boardH + 8);
+
+  // Warm parchment floor
+  for (let y = 0; y < maze.rows; y++) {
+    for (let x = 0; x < maze.cols; x++) {
+      if (maze.cells[y * maze.cols + x] !== 1) {
+        const fx = offsetX + x * cellSize;
+        const fy = offsetY + y * cellSize;
+        const checker = (x + y) % 2 === 0;
+        ctx.fillStyle = checker ? '#EFE4CE' : '#E7DAC0';
+        ctx.fillRect(fx, fy, cellSize, cellSize);
+
+        ctx.strokeStyle = 'rgba(22, 35, 40, 0.08)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(fx + 0.5, fy + 0.5, cellSize - 1, cellSize - 1);
+      }
+    }
+  }
+
+  // Cast wall shadows
+  const shadowDepth = Math.max(3, Math.round(cellSize * 0.16));
+  ctx.fillStyle = 'rgba(16, 30, 35, 0.22)';
+  for (let y = 0; y < maze.rows - 1; y++) {
+    for (let x = 0; x < maze.cols; x++) {
+      if (
+        maze.cells[y * maze.cols + x] === 1 &&
+        maze.cells[(y + 1) * maze.cols + x] !== 1
+      ) {
+        ctx.fillRect(
+          offsetX + x * cellSize,
+          offsetY + (y + 1) * cellSize,
+          cellSize,
+          shadowDepth
+        );
+      }
+    }
+  }
+
+  // Carved stone walls
+  for (let y = 0; y < maze.rows; y++) {
+    for (let x = 0; x < maze.cols; x++) {
+      if (maze.cells[y * maze.cols + x] === 1) {
+        const wx = offsetX + x * cellSize;
+        const wy = offsetY + y * cellSize;
+
+        ctx.fillStyle = '#203B43';
+        ctx.fillRect(wx, wy, cellSize, cellSize);
+
+        ctx.strokeStyle = '#15282E';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(wx + 0.5, wy + 0.5, cellSize - 1, cellSize - 1);
+
+        const aboveFloor = y > 0 && maze.cells[(y - 1) * maze.cols + x] !== 1;
+        if (aboveFloor) {
+          ctx.fillStyle = '#315762';
+          ctx.fillRect(wx, wy, cellSize, Math.max(2, cellSize * 0.12));
+        }
+
+        const belowFloor =
+          y < maze.rows - 1 && maze.cells[(y + 1) * maze.cols + x] !== 1;
+        if (belowFloor) {
+          const lipH = Math.max(3, Math.round(cellSize * 0.22));
+          ctx.fillStyle = '#13262C';
+          ctx.fillRect(wx, wy + cellSize - lipH, cellSize, lipH);
+          ctx.fillStyle = '#0C181C';
+          ctx.fillRect(wx, wy + cellSize - 2, cellSize, 2);
+        }
+      }
+    }
+  }
+
+  return cache;
+}
+
 export const MazeCanvas: React.FC<MazeCanvasProps> = ({
   maze,
   phase,
@@ -51,20 +154,28 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
   visibilityMode,
   liveTickRef,
   effectsRef,
+  localInputRef,
   onPingCell,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mazeCacheRef = useRef<HTMLCanvasElement | null>(null);
   const smoothedRef = useRef<Map<string, SmoothedPlayer>>(new Map());
   const floatingRef = useRef<FloatingBanner[]>([]);
   const seenEffectsRef = useRef<Set<string>>(new Set());
   const shakeRef = useRef<number>(0);
 
+  const propsRef = useRef({ phase, playerId, myRole, visibilityMode });
+  propsRef.current = { phase, playerId, myRole, visibilityMode };
+
   const layoutRef = useRef<{
     offsetX: number;
     offsetY: number;
     cellSize: number;
-  }>({ offsetX: 0, offsetY: 0, cellSize: 32 });
+    viewW: number;
+    viewH: number;
+    dpr: number;
+  }>({ offsetX: 0, offsetY: 0, cellSize: 32, viewW: 800, viewH: 600, dpr: 1 });
 
   useEffect(() => {
     smoothedRef.current.clear();
@@ -86,22 +197,40 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const w = Math.max(200, Math.floor(rect.width));
       const h = Math.max(200, Math.floor(rect.height));
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
       canvas.style.width = `${w}px`;
       canvas.style.height = `${h}px`;
 
       const pad = 16;
-      const cellSize = Math.floor(
-        Math.min((w - pad * 2) / maze.cols, (h - pad * 2) / maze.rows)
+      const cellSize = Math.max(
+        10,
+        Math.floor(
+          Math.min((w - pad * 2) / maze.cols, (h - pad * 2) / maze.rows)
+        )
       );
       const boardW = cellSize * maze.cols;
       const boardH = cellSize * maze.rows;
+      const offsetX = Math.floor((w - boardW) / 2);
+      const offsetY = Math.floor((h - boardH) / 2);
+
       layoutRef.current = {
-        cellSize: Math.max(10, cellSize),
-        offsetX: Math.floor((w - boardW) / 2),
-        offsetY: Math.floor((h - boardH) / 2),
+        cellSize,
+        offsetX,
+        offsetY,
+        viewW: w,
+        viewH: h,
+        dpr,
       };
+      mazeCacheRef.current = buildStaticMazeCache(
+        maze,
+        w,
+        h,
+        dpr,
+        offsetX,
+        offsetY,
+        cellSize
+      );
     };
 
     resize();
@@ -109,7 +238,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
     ro.observe(container);
 
     const render = (now: number) => {
-      const dt = Math.min(0.05, (now - lastTime) / 1000);
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastTime) / 1000));
       lastTime = now;
 
       const ctx = canvas.getContext('2d');
@@ -118,10 +247,13 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         return;
       }
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const viewW = canvas.width / dpr;
-      const viewH = canvas.height / dpr;
-      const { offsetX, offsetY, cellSize } = layoutRef.current;
+      const {
+        phase: curPhase,
+        playerId: curPlayerId,
+        myRole: curMyRole,
+        visibilityMode: curVisMode,
+      } = propsRef.current;
+      const { offsetX, offsetY, cellSize, viewW, viewH, dpr } = layoutRef.current;
 
       for (const ef of effectsRef.current) {
         if (!seenEffectsRef.current.has(ef.id)) {
@@ -199,85 +331,19 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       ctx.save();
       ctx.scale(dpr, dpr);
 
-      ctx.fillStyle = '#132227';
-      ctx.fillRect(0, 0, viewW, viewH);
+      if (shakeX !== 0 || shakeY !== 0) {
+        ctx.fillStyle = '#132227';
+        ctx.fillRect(0, 0, viewW, viewH);
+        ctx.translate(shakeX, shakeY);
+      }
 
-      ctx.translate(shakeX, shakeY);
+      // Draw pre-rendered static maze in 1 draw call
+      if (mazeCacheRef.current) {
+        ctx.drawImage(mazeCacheRef.current, 0, 0, viewW, viewH);
+      }
 
       const boardW = cellSize * maze.cols;
       const boardH = cellSize * maze.rows;
-
-      ctx.fillStyle = '#0B1417';
-      ctx.fillRect(offsetX - 4, offsetY - 4, boardW + 8, boardH + 8);
-
-      // Warm parchment floor
-      for (let y = 0; y < maze.rows; y++) {
-        for (let x = 0; x < maze.cols; x++) {
-          if (maze.cells[y * maze.cols + x] !== 1) {
-            const fx = offsetX + x * cellSize;
-            const fy = offsetY + y * cellSize;
-            const checker = (x + y) % 2 === 0;
-            ctx.fillStyle = checker ? '#EFE4CE' : '#E7DAC0';
-            ctx.fillRect(fx, fy, cellSize, cellSize);
-
-            ctx.strokeStyle = 'rgba(22, 35, 40, 0.08)';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(fx + 0.5, fy + 0.5, cellSize - 1, cellSize - 1);
-          }
-        }
-      }
-
-      // Cast wall shadows
-      const shadowDepth = Math.max(3, Math.round(cellSize * 0.16));
-      ctx.fillStyle = 'rgba(16, 30, 35, 0.22)';
-      for (let y = 0; y < maze.rows - 1; y++) {
-        for (let x = 0; x < maze.cols; x++) {
-          if (
-            maze.cells[y * maze.cols + x] === 1 &&
-            maze.cells[(y + 1) * maze.cols + x] !== 1
-          ) {
-            ctx.fillRect(
-              offsetX + x * cellSize,
-              offsetY + (y + 1) * cellSize,
-              cellSize,
-              shadowDepth
-            );
-          }
-        }
-      }
-
-      // Carved stone walls
-      for (let y = 0; y < maze.rows; y++) {
-        for (let x = 0; x < maze.cols; x++) {
-          if (maze.cells[y * maze.cols + x] === 1) {
-            const wx = offsetX + x * cellSize;
-            const wy = offsetY + y * cellSize;
-
-            ctx.fillStyle = '#203B43';
-            ctx.fillRect(wx, wy, cellSize, cellSize);
-
-            ctx.strokeStyle = '#15282E';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(wx + 0.5, wy + 0.5, cellSize - 1, cellSize - 1);
-
-            const aboveFloor = y > 0 && maze.cells[(y - 1) * maze.cols + x] !== 1;
-            if (aboveFloor) {
-              ctx.fillStyle = '#315762';
-              ctx.fillRect(wx, wy, cellSize, Math.max(2, cellSize * 0.12));
-            }
-
-            const belowFloor =
-              y < maze.rows - 1 && maze.cells[(y + 1) * maze.cols + x] !== 1;
-            if (belowFloor) {
-              const lipH = Math.max(3, Math.round(cellSize * 0.22));
-              ctx.fillStyle = '#13262C';
-              ctx.fillRect(wx, wy + cellSize - lipH, cellSize, lipH);
-              ctx.fillStyle = '#0C181C';
-              ctx.fillRect(wx, wy + cellSize - 2, cellSize, 2);
-            }
-          }
-        }
-      }
 
       // Portals
       if (maze.portals) {
@@ -367,7 +433,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         const isWeapon = item.type === 'weapon';
         const r = cellSize * (isWeapon ? 0.36 : 0.3);
 
-        // Special pulsing halo for rare weapon coin
         if (isWeapon) {
           const halo = cellSize * (0.55 + 0.12 * Math.sin(now * 0.008));
           const wGrad = ctx.createRadialGradient(ix, iy, r * 0.2, ix, iy, halo * 1.4);
@@ -455,13 +520,13 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       }
 
       const rawPlayers = (tick?.players ?? []).filter((p) => p.alive);
-      const meRaw = rawPlayers.find((p) => p.id === playerId);
+      const meRaw = rawPlayers.find((p) => p.id === curPlayerId);
       const amIAlive = Boolean(meRaw);
 
       // Radar Echoes (periodic hero clues in fog/asymmetric modes)
       if (
         tick?.echoes &&
-        (myRole === 'hunter' || visibilityMode === 'fog_both' || !amIAlive)
+        (curMyRole === 'hunter' || curVisMode === 'fog_both' || !amIAlive)
       ) {
         for (const ec of tick.echoes) {
           const ex = offsetX + ec.x * cellSize;
@@ -491,7 +556,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       }
 
       // Tactical Hunter Pings (visible only to Guards and eliminated spectators)
-      if (tick?.pings && (myRole === 'hunter' || !amIAlive)) {
+      if (tick?.pings && (curMyRole === 'hunter' || !amIAlive)) {
         for (const pg of tick.pings) {
           const px = offsetX + pg.x * cellSize;
           const py = offsetY + pg.y * cellSize;
@@ -518,12 +583,12 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       // Asymmetric visibility filtering
       const players = rawPlayers.filter((p) => {
         if (!amIAlive || !meRaw) return true;
-        if (phase === 'COUNTDOWN') return true;
-        if (p.id === playerId || p.role === myRole) return true;
-        if (visibilityMode === 'all_visible') return true;
-        if (visibilityMode === 'heroes_see_all' && myRole === 'hero') return true;
+        if (curPhase === 'COUNTDOWN') return true;
+        if (p.id === curPlayerId || p.role === curMyRole) return true;
+        if (curVisMode === 'all_visible') return true;
+        if (curVisMode === 'heroes_see_all' && curMyRole === 'hero') return true;
         const radius =
-          myRole === 'hero' ? HERO_VISION_RADIUS : HUNTER_VISION_RADIUS;
+          curMyRole === 'hero' ? HERO_VISION_RADIUS : HUNTER_VISION_RADIUS;
         return Math.hypot(p.x - meRaw.x, p.y - meRaw.y) <= radius;
       });
 
@@ -538,9 +603,14 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         return 0;
       });
 
+      const elapsedSinceTick = tick
+        ? Math.min(0.14, Math.max(0, (now - tick.t) / 1000))
+        : 0;
+      const huntersLocked = (tick?.huntersReleaseIn ?? 0) > 0;
       let mySmoothedPos: { x: number; y: number } | null = null;
 
       for (const p of sortedPlayers) {
+        const isMe = p.id === curPlayerId;
         let sm = smoothedRef.current.get(p.id);
         if (!sm) {
           sm = {
@@ -554,17 +624,80 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
             trail: [],
           };
           smoothedRef.current.set(p.id, sm);
+        } else if (isMe && curPhase === 'PLAYING') {
+          // Local client-side prediction + gentle server reconciliation
+          const jump = Math.hypot(p.x - sm.x, p.y - sm.y);
+          if (jump > 2.2) {
+            // Portal warp or respawn
+            sm.x = p.x;
+            sm.y = p.y;
+            sm.trail = [];
+          } else {
+            const inp = localInputRef.current;
+            const canMoveLocally =
+              p.stunTimer <= 0 && !(p.role === 'hunter' && huntersLocked);
+
+            if (canMoveLocally && (Math.abs(inp.dx) > 0.01 || Math.abs(inp.dy) > 0.01)) {
+              let speed = p.role === 'hero' ? HERO_BASE_SPEED : HUNTER_BASE_SPEED;
+              if (p.dashActive > 0) {
+                speed *= p.role === 'hero' ? HERO_DASH_MULT : HUNTER_DASH_MULT;
+              }
+              if (p.speedBoost > 0) speed *= 1.35;
+
+              sm.vx = inp.dx * speed;
+              sm.vy = inp.dy * speed;
+              sm.x += sm.vx * dt;
+              sm.y += sm.vy * dt;
+              resolveMazeCollisions(sm, maze);
+
+              // Gentle drift correction toward host-predicted point
+              const serverPred = {
+                x: p.x + p.vx * elapsedSinceTick,
+                y: p.y + p.vy * elapsedSinceTick,
+              };
+              resolveMazeCollisions(serverPred, maze);
+              const err = Math.hypot(serverPred.x - sm.x, serverPred.y - sm.y);
+              if (err > 0.14) {
+                const corr = 1 - Math.exp(-6.0 * dt);
+                sm.x += (serverPred.x - sm.x) * corr;
+                sm.y += (serverPred.y - sm.y) * corr;
+              }
+            } else {
+              sm.vx = p.vx;
+              sm.vy = p.vy;
+              const blend = 1 - Math.exp(-16 * dt);
+              sm.x += (p.x - sm.x) * blend;
+              sm.y += (p.y - sm.y) * blend;
+            }
+          }
+
+          const spd = Math.hypot(sm.vx, sm.vy);
+          if (spd > 0.2) {
+            sm.facingX = sm.vx / spd;
+            sm.facingY = sm.vy / spd;
+            sm.walkPhase += dt * spd * 3.4;
+          }
         } else {
+          // Remote player: wall-aware velocity extrapolation + smooth blending
           const jump = Math.hypot(p.x - sm.x, p.y - sm.y);
           if (jump > 2.5) {
             sm.x = p.x;
             sm.y = p.y;
             sm.trail = [];
           } else {
-            const blend = 1 - Math.exp(-22 * dt);
-            sm.x += (p.x - sm.x) * blend;
-            sm.y += (p.y - sm.y) * blend;
+            const targetPos = {
+              x: p.x + p.vx * elapsedSinceTick,
+              y: p.y + p.vy * elapsedSinceTick,
+            };
+            if (Math.abs(p.vx) > 0.01 || Math.abs(p.vy) > 0.01) {
+              resolveMazeCollisions(targetPos, maze);
+            }
+            const blend = 1 - Math.exp(-15 * dt);
+            sm.x += (targetPos.x - sm.x) * blend;
+            sm.y += (targetPos.y - sm.y) * blend;
           }
+          sm.vx = p.vx;
+          sm.vy = p.vy;
           const spd = Math.hypot(p.vx, p.vy);
           if (spd > 0.2) {
             sm.facingX = p.vx / spd;
@@ -573,7 +706,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
           }
         }
 
-        if (p.id === playerId) {
+        if (isMe) {
           mySmoothedPos = { x: sm.x, y: sm.y };
         }
 
@@ -586,7 +719,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         }
         sm.trail = sm.trail.filter((t) => t.alpha > 0.05);
 
-        const moving = Math.hypot(p.vx, p.vy) > 0.25;
+        const moving = Math.hypot(sm.vx, sm.vy) > 0.25;
         const bobY = moving ? Math.abs(Math.sin(sm.walkPhase)) * (cellSize * 0.09) : 0;
 
         const basePx = offsetX + sm.x * cellSize;
@@ -595,7 +728,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         const py = basePy - bobY;
         const r = cellSize * 0.31;
         const isHero = p.role === 'hero';
-        const isMe = p.id === playerId;
 
         for (const tr of sm.trail) {
           ctx.fillStyle = isHero ? '#F59E0B' : '#E11D48';
@@ -621,7 +753,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
           ctx.globalAlpha = 0.45;
         }
 
-        // Armed Hero sword aura
         if (isHero && p.weaponCharges > 0) {
           ctx.save();
           ctx.translate(px, py);
@@ -646,7 +777,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
           ctx.setLineDash([]);
         }
 
-        // Hero cape
         if (isHero) {
           const capeX = px - sm.facingX * r * 0.9;
           const capeY = py - sm.facingY * r * 0.9;
@@ -665,7 +795,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
           ctx.stroke();
         }
 
-        // Character body
         ctx.fillStyle = isHero ? '#FBBF24' : p.color;
         ctx.strokeStyle = '#162328';
         ctx.lineWidth = Math.max(2, cellSize * 0.075);
@@ -692,7 +821,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
           ctx.setLineDash([]);
         }
 
-        // Eyes
         const eyeDist = r * 0.34;
         const ex = px + sm.facingX * eyeDist;
         const ey = py + sm.facingY * eyeDist;
@@ -704,7 +832,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         ctx.arc(ex - perpX, ey - perpY, Math.max(1.7, r * 0.16), 0, Math.PI * 2);
         ctx.fill();
 
-        // Hero crown (and sword marker if armed)
         if (isHero) {
           const cw = r * 0.9;
           const ch = r * 0.58;
@@ -744,14 +871,14 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       const hasFog =
         amIAlive &&
         mySmoothedPos &&
-        ((visibilityMode === 'heroes_see_all' && myRole === 'hunter') ||
-          visibilityMode === 'fog_both');
+        ((curVisMode === 'heroes_see_all' && curMyRole === 'hunter') ||
+          curVisMode === 'fog_both');
 
       if (hasFog && mySmoothedPos) {
         const vx = offsetX + mySmoothedPos.x * cellSize;
         const vy = offsetY + mySmoothedPos.y * cellSize;
         const radCells =
-          myRole === 'hero' ? HERO_VISION_RADIUS : HUNTER_VISION_RADIUS;
+          curMyRole === 'hero' ? HERO_VISION_RADIUS : HUNTER_VISION_RADIUS;
         const vr = radCells * cellSize;
 
         ctx.save();
@@ -761,7 +888,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         ctx.fillStyle = 'rgba(13, 24, 28, 0.44)';
         ctx.fill('evenodd');
 
-        // Crisp lantern ring edge
         ctx.strokeStyle = 'rgba(251, 191, 36, 0.38)';
         ctx.lineWidth = 2;
         ctx.setLineDash([6, 6]);
@@ -803,7 +929,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       cancelAnimationFrame(animId);
       ro.disconnect();
     };
-  }, [maze, phase, playerId, myRole, visibilityMode, liveTickRef, effectsRef]);
+  }, [maze, liveTickRef, effectsRef, localInputRef]);
 
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (myRole !== 'hunter') return;
