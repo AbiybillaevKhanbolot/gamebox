@@ -345,6 +345,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({
           {roomState.maze && (
             <MazeCanvas
               maze={roomState.maze}
+              phase={roomState.phase}
               playerId={playerId}
               myRole={myRole}
               visibilityMode={roomState.settings.visibilityMode}

@@ -1,4 +1,4 @@
-import Peer, { type DataConnection } from 'peerjs';
+import mqtt, { type MqttClient } from 'mqtt';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ChatMessage,
@@ -34,31 +34,23 @@ export interface VisualEffect {
   createdAt: number;
 }
 
-const PEER_PREFIX = 'maze-escape-office-';
+const TOPIC_PREFIX = 'maze-escape-v2';
 
-// Include both public STUN servers AND PeerJS's default TURN relay servers
-// so WebRTC works reliably across different Wi-Fi/NAT/mobile networks.
-const PEER_CONFIG = {
-  config: {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      {
-        urls: [
-          'turn:eu-0.turn.peerjs.com:3478',
-          'turn:us-0.turn.peerjs.com:3478',
-        ],
-        username: 'peerjs',
-        credential: 'peerjsp',
-      },
-    ],
-  },
-};
+// Reliable public TLS WebSocket MQTT brokers that work on GitHub Pages across NAT/firewalls
+const MQTT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
 
 function generateShortCode(): string {
   // 5-digit numeric code works identically on RU and EN keyboard layouts
   return String(10000 + Math.floor(Math.random() * 90000));
+}
+
+function randomClientId(): string {
+  return `mze_${Math.random().toString(36).slice(2, 10)}${Date.now()
+    .toString(36)
+    .slice(-4)}`;
 }
 
 export function normalizeRoomCode(raw: string): string {
@@ -83,11 +75,18 @@ export function normalizeRoomCode(raw: string): string {
 }
 
 export function useGameSocket() {
-  const peerRef = useRef<Peer | null>(null);
+  const mqttClientRef = useRef<MqttClient | null>(null);
   const hostEngineRef = useRef<HostGameEngine | null>(null);
-  const clientConnRef = useRef<DataConnection | null>(null);
+  const guestClientIdRef = useRef<string | null>(null);
+  const activeRoomCodeRef = useRef<string | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryJoinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastInputSentRef = useRef<{ dx: number; dy: number; at: number }>({
+    dx: 0,
+    dy: 0,
+    at: 0,
+  });
 
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -128,7 +127,7 @@ export function useGameSocket() {
   const playerIdRef = useRef<string | null>(null);
   playerIdRef.current = playerId;
 
-  const cleanupNetwork = useCallback(() => {
+  const cleanupNetwork = useCallback((notifyLeave = true) => {
     if (heartbeatRef.current) {
       clearInterval(heartbeatRef.current);
       heartbeatRef.current = null;
@@ -137,26 +136,40 @@ export function useGameSocket() {
       clearTimeout(connectTimeoutRef.current);
       connectTimeoutRef.current = null;
     }
+    if (retryJoinTimerRef.current) {
+      clearTimeout(retryJoinTimerRef.current);
+      retryJoinTimerRef.current = null;
+    }
+
+    const client = mqttClientRef.current;
+    const roomCode = activeRoomCodeRef.current;
+    const guestId = guestClientIdRef.current;
+
     if (hostEngineRef.current) {
       hostEngineRef.current.dispose();
       hostEngineRef.current = null;
-    }
-    if (clientConnRef.current) {
+    } else if (notifyLeave && client && client.connected && roomCode && guestId) {
       try {
-        clientConnRef.current.close();
+        client.publish(
+          `${TOPIC_PREFIX}/${roomCode}/to-host`,
+          JSON.stringify({ from: guestId, msg: { type: 'leave_room' } })
+        );
       } catch {
         // ignore
       }
-      clientConnRef.current = null;
     }
-    if (peerRef.current) {
+
+    if (client) {
+      mqttClientRef.current = null;
       try {
-        peerRef.current.destroy();
+        client.end(true);
       } catch {
         // ignore
       }
-      peerRef.current = null;
     }
+
+    guestClientIdRef.current = null;
+    activeRoomCodeRef.current = null;
     setConnected(false);
     setConnecting(false);
   }, []);
@@ -168,6 +181,10 @@ export function useGameSocket() {
           if (connectTimeoutRef.current) {
             clearTimeout(connectTimeoutRef.current);
             connectTimeoutRef.current = null;
+          }
+          if (retryJoinTimerRef.current) {
+            clearTimeout(retryJoinTimerRef.current);
+            retryJoinTimerRef.current = null;
           }
           setConnecting(false);
           setConnected(true);
@@ -296,7 +313,7 @@ export function useGameSocket() {
         }
 
         case 'room_closed': {
-          cleanupNetwork();
+          cleanupNetwork(false);
           setRoomState(null);
           setPlayerId(null);
           setError(msg.message);
@@ -304,6 +321,14 @@ export function useGameSocket() {
         }
 
         case 'error': {
+          if (connectTimeoutRef.current) {
+            clearTimeout(connectTimeoutRef.current);
+            connectTimeoutRef.current = null;
+          }
+          if (retryJoinTimerRef.current) {
+            clearTimeout(retryJoinTimerRef.current);
+            retryJoinTimerRef.current = null;
+          }
           setConnecting(false);
           setError(msg.message);
           break;
@@ -318,10 +343,31 @@ export function useGameSocket() {
       hostEngineRef.current.handleHostAction(msg);
       return;
     }
-    const conn = clientConnRef.current;
-    if (conn && conn.open) {
-      conn.send(msg);
+
+    const client = mqttClientRef.current;
+    const roomCode = activeRoomCodeRef.current;
+    const guestId = guestClientIdRef.current;
+    if (!client || !client.connected || !roomCode || !guestId) return;
+
+    if (msg.type === 'input') {
+      const now = performance.now();
+      const prev = lastInputSentRef.current;
+      const isZero = msg.dx === 0 && msg.dy === 0;
+      const prevZero = prev.dx === 0 && prev.dy === 0;
+      if (!msg.dash && !msg.attack) {
+        if (isZero && prevZero) return;
+        if (msg.dx === prev.dx && msg.dy === prev.dy && now - prev.at < 90) {
+          return;
+        }
+      }
+      lastInputSentRef.current = { dx: msg.dx, dy: msg.dy, at: now };
     }
+
+    client.publish(
+      `${TOPIC_PREFIX}/${roomCode}/to-host`,
+      JSON.stringify({ from: guestId, msg }),
+      { qos: 0 }
+    );
   }, []);
 
   const createRoom = useCallback(
@@ -332,64 +378,130 @@ export function useGameSocket() {
         return;
       }
 
-      cleanupNetwork();
+      cleanupNetwork(false);
       setError(null);
       setConnecting(true);
 
-      let attempts = 0;
+      const code = generateShortCode();
+      activeRoomCodeRef.current = code;
 
-      const tryCreate = () => {
-        const code = generateShortCode();
-        const peer = new Peer(`${PEER_PREFIX}${code}`, PEER_CONFIG);
-        peerRef.current = peer;
+      const connectWithBroker = (brokerIdx: number) => {
+        if (activeRoomCodeRef.current !== code) return;
+        const brokerUrl = MQTT_BROKERS[brokerIdx];
+        const clientId = randomClientId();
 
-        peer.on('open', () => {
-          setConnecting(false);
-          setConnected(true);
-          if (!hostEngineRef.current) {
-            const engine = new HostGameEngine(code, cleanName, handleServerMessage);
-            hostEngineRef.current = engine;
-          }
+        const client = mqtt.connect(brokerUrl, {
+          clientId,
+          clean: true,
+          connectTimeout: 6000,
+          reconnectPeriod: 2500,
+          keepalive: 25,
         });
+        mqttClientRef.current = client;
 
-        peer.on('disconnected', () => {
-          // Keep host registered on signaling server so new players can still join
-          if (!peer.destroyed) {
-            try {
-              peer.reconnect();
-            } catch {
-              // ignore
-            }
+        let opened = false;
+        const failTimer = setTimeout(() => {
+          if (opened || activeRoomCodeRef.current !== code) return;
+          try {
+            client.end(true);
+          } catch {
+            // ignore
           }
-        });
-
-        peer.on('connection', (conn) => {
-          if (hostEngineRef.current) {
-            hostEngineRef.current.attachConnection(conn);
+          if (brokerIdx + 1 < MQTT_BROKERS.length) {
+            connectWithBroker(brokerIdx + 1);
           } else {
-            conn.close();
+            cleanupNetwork(false);
+            setError(
+              'Не удалось подключиться к игровому ретранслятору. Проверьте интернет и попробуйте снова.'
+            );
+          }
+        }, 5500);
+        connectTimeoutRef.current = failTimer;
+
+        const toHostTopic = `${TOPIC_PREFIX}/${code}/to-host`;
+        const toAllTopic = `${TOPIC_PREFIX}/${code}/to-all`;
+
+        client.on('connect', () => {
+          opened = true;
+          clearTimeout(failTimer);
+          if (connectTimeoutRef.current === failTimer) {
+            connectTimeoutRef.current = null;
+          }
+
+          if (brokerIdx > 0) {
+            const url = new URL(window.location.href);
+            url.searchParams.set('s', String(brokerIdx));
+            window.history.replaceState({}, '', url.toString());
+          }
+
+          client.subscribe(toHostTopic, { qos: 0 }, (subErr) => {
+            if (subErr) {
+              cleanupNetwork(false);
+              setError('Не удалось открыть канал комнаты. Попробуйте ещё раз.');
+              return;
+            }
+
+            setConnecting(false);
+            setConnected(true);
+
+            if (!hostEngineRef.current) {
+              const engine = new HostGameEngine(code, cleanName, {
+                onHostMessage: handleServerMessage,
+                onSendToClient: (targetClientId, serverMsg) => {
+                  const activeClient = mqttClientRef.current;
+                  if (activeClient && activeClient.connected) {
+                    activeClient.publish(
+                      `${TOPIC_PREFIX}/${code}/to/${targetClientId}`,
+                      JSON.stringify(serverMsg),
+                      { qos: 0 }
+                    );
+                  }
+                },
+                onBroadcast: (serverMsg) => {
+                  const activeClient = mqttClientRef.current;
+                  if (activeClient && activeClient.connected) {
+                    activeClient.publish(
+                      toAllTopic,
+                      JSON.stringify(serverMsg),
+                      { qos: 0 }
+                    );
+                  }
+                },
+              });
+              hostEngineRef.current = engine;
+            }
+          });
+        });
+
+        client.on('message', (topic, rawPayload) => {
+          if (topic !== toHostTopic || !hostEngineRef.current) return;
+          try {
+            const parsed = JSON.parse(rawPayload.toString()) as {
+              from?: string;
+              msg?: ClientMessage;
+            };
+            if (parsed.from && parsed.msg) {
+              hostEngineRef.current.handleRemoteMessage(parsed.from, parsed.msg);
+            }
+          } catch {
+            // ignore malformed message
           }
         });
 
-        peer.on('error', (err) => {
-          if (err.type === 'unavailable-id' && attempts < 5) {
-            attempts++;
+        client.on('error', () => {
+          if (!opened && brokerIdx + 1 < MQTT_BROKERS.length) {
+            clearTimeout(failTimer);
             try {
-              peer.destroy();
+              client.end(true);
             } catch {
               // ignore
             }
-            tryCreate();
-            return;
+            connectWithBroker(brokerIdx + 1);
           }
-          // Ignore transient signaling errors after room is already active
-          if (hostEngineRef.current) return;
-          setConnecting(false);
-          setError('Не удалось создать комнату. Проверьте доступ к сети и попробуйте ещё раз.');
         });
       };
 
-      tryCreate();
+      connectWithBroker(0);
     },
     [cleanupNetwork, handleServerMessage]
   );
@@ -407,107 +519,158 @@ export function useGameSocket() {
         return;
       }
 
-      cleanupNetwork();
+      cleanupNetwork(false);
       setError(null);
       setConnecting(true);
 
-      const peer = new Peer(PEER_CONFIG);
-      peerRef.current = peer;
+      const urlParams = new URLSearchParams(window.location.search);
+      const preferredBroker = Number(urlParams.get('s') || '0');
+      const brokerOrder =
+        preferredBroker > 0 && preferredBroker < MQTT_BROKERS.length
+          ? [preferredBroker, ...MQTT_BROKERS.map((_, i) => i).filter((i) => i !== preferredBroker)]
+          : MQTT_BROKERS.map((_, i) => i);
 
-      connectTimeoutRef.current = setTimeout(() => {
-        cleanupNetwork();
-        setError(
-          `Не удалось установить P2P-соединение с комнатой «${code}». Если вы в корпоративном VPN/файрволе, попробуйте открыть игру без VPN или с одной сети.`
-        );
-      }, 18000);
+      activeRoomCodeRef.current = code;
+      const myClientId = randomClientId();
+      guestClientIdRef.current = myClientId;
 
-      peer.on('open', () => {
-        const conn = peer.connect(`${PEER_PREFIX}${code}`, {
-          reliable: true,
-          serialization: 'json',
-        });
-        clientConnRef.current = conn;
-
-        const sendJoin = () => {
-          conn.send({
-            type: 'join_room',
-            roomCode: code,
-            name: cleanName,
-          } satisfies ClientMessage);
-
-          if (!heartbeatRef.current) {
-            heartbeatRef.current = setInterval(() => {
-              if (conn.open) {
-                conn.send({ type: 'heartbeat' } satisfies ClientMessage);
-              }
-            }, 2500);
-          }
-        };
-
-        if (conn.open) {
-          sendJoin();
-        } else {
-          conn.on('open', sendJoin);
+      const attemptJoinOnBroker = (orderIdx: number) => {
+        if (activeRoomCodeRef.current !== code || guestClientIdRef.current !== myClientId) {
+          return;
         }
+        const brokerUrl = MQTT_BROKERS[brokerOrder[orderIdx]];
+        let gotReply = false;
 
-        conn.on('data', (raw) => {
+        const client = mqtt.connect(brokerUrl, {
+          clientId: myClientId,
+          clean: true,
+          connectTimeout: 5500,
+          reconnectPeriod: 2500,
+          keepalive: 25,
+        });
+        mqttClientRef.current = client;
+
+        const toHostTopic = `${TOPIC_PREFIX}/${code}/to-host`;
+        const toAllTopic = `${TOPIC_PREFIX}/${code}/to-all`;
+        const toMeTopic = `${TOPIC_PREFIX}/${code}/to/${myClientId}`;
+
+        const waitTimer = setTimeout(() => {
+          if (gotReply || activeRoomCodeRef.current !== code) return;
           try {
-            const msg = (
-              typeof raw === 'string' ? JSON.parse(raw) : raw
-            ) as ServerMessage;
+            client.end(true);
+          } catch {
+            // ignore
+          }
+          if (orderIdx + 1 < brokerOrder.length) {
+            attemptJoinOnBroker(orderIdx + 1);
+          } else {
+            cleanupNetwork(false);
+            setError(
+              `Комната «${code}» не найдена. Проверьте код или убедитесь, что ведущий не закрыл вкладку.`
+            );
+          }
+        }, 6500);
+        connectTimeoutRef.current = waitTimer;
+
+        client.on('connect', () => {
+          client.subscribe([toAllTopic, toMeTopic], { qos: 0 }, (subErr) => {
+            if (subErr) return;
+
+            const publishJoin = () => {
+              if (!client.connected) return;
+              client.publish(
+                toHostTopic,
+                JSON.stringify({
+                  from: myClientId,
+                  msg: {
+                    type: 'join_room',
+                    roomCode: code,
+                    name: cleanName,
+                    playerId: playerIdRef.current ?? undefined,
+                  } satisfies ClientMessage,
+                }),
+                { qos: 0 }
+              );
+            };
+
+            publishJoin();
+
+            if (!gotReply) {
+              if (retryJoinTimerRef.current) clearTimeout(retryJoinTimerRef.current);
+              retryJoinTimerRef.current = setTimeout(() => {
+                if (!gotReply && client.connected) {
+                  publishJoin();
+                }
+              }, 1600);
+            }
+
+            if (!heartbeatRef.current) {
+              heartbeatRef.current = setInterval(() => {
+                if (client.connected) {
+                  client.publish(
+                    toHostTopic,
+                    JSON.stringify({
+                      from: myClientId,
+                      msg: { type: 'heartbeat' } satisfies ClientMessage,
+                    }),
+                    { qos: 0 }
+                  );
+                }
+              }, 3000);
+            }
+          });
+        });
+
+        client.on('message', (_topic, rawPayload) => {
+          try {
+            const msg = JSON.parse(rawPayload.toString()) as ServerMessage;
+            if (msg.type === 'joined' || msg.type === 'error') {
+              gotReply = true;
+              clearTimeout(waitTimer);
+            }
             handleServerMessage(msg);
           } catch {
             // ignore
           }
         });
 
-        conn.on('close', () => {
-          cleanupNetwork();
-          setRoomState((prev) => {
-            if (prev) {
-              setError('Соединение с комнатой потеряно');
+        client.on('error', () => {
+          if (!gotReply && orderIdx + 1 < brokerOrder.length) {
+            clearTimeout(waitTimer);
+            try {
+              client.end(true);
+            } catch {
+              // ignore
             }
-            return null;
-          });
-          setPlayerId(null);
+            attemptJoinOnBroker(orderIdx + 1);
+          }
         });
+      };
 
-        conn.on('error', () => {
-          cleanupNetwork();
-          setError(`Не удалось подключиться к комнате «${code}»`);
-        });
-      });
-
-      peer.on('error', (err) => {
-        cleanupNetwork();
-        if (err.type === 'peer-unavailable') {
-          setError(`Комната «${code}» не найдена. Проверьте код или убедитесь, что ведущий не закрыл вкладку.`);
-        } else {
-          setError('Ошибка WebRTC-подключения. Попробуйте ещё раз.');
-        }
-      });
+      attemptJoinOnBroker(0);
     },
     [cleanupNetwork, handleServerMessage]
   );
 
   const leaveRoom = useCallback(() => {
-    cleanupNetwork();
+    cleanupNetwork(true);
     setRoomState(null);
     setPlayerId(null);
     setError(null);
     const url = new URL(window.location.href);
     url.searchParams.delete('room');
+    url.searchParams.delete('s');
     window.history.replaceState({}, '', url.toString());
   }, [cleanupNetwork]);
 
   useEffect(() => {
     const onBeforeUnload = () => {
-      cleanupNetwork();
+      cleanupNetwork(true);
     };
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload);
-      cleanupNetwork();
+      cleanupNetwork(true);
     };
   }, [cleanupNetwork]);
 

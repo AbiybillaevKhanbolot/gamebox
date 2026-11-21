@@ -181,7 +181,8 @@ export type ClientMessage =
   | { type: 'input'; dx: number; dy: number; dash: boolean; attack?: boolean; seq: number }
   | { type: 'chat'; text: string }
   | { type: 'ping_cell'; x: number; y: number }
-  | { type: 'heartbeat' };
+  | { type: 'heartbeat' }
+  | { type: 'leave_room' };
 
 export type ServerMessage =
   | {

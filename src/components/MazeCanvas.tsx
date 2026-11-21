@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import type {
+  GamePhase,
   MazeData,
   PlayerRole,
   VisibilityMode,
@@ -12,6 +13,7 @@ import type { LiveTickData, VisualEffect } from '../hooks/useGameSocket.ts';
 
 interface MazeCanvasProps {
   maze: MazeData;
+  phase: GamePhase;
   playerId: string | null;
   myRole: PlayerRole;
   visibilityMode: VisibilityMode;
@@ -43,6 +45,7 @@ interface FloatingBanner {
 
 export const MazeCanvas: React.FC<MazeCanvasProps> = ({
   maze,
+  phase,
   playerId,
   myRole,
   visibilityMode,
@@ -451,8 +454,15 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         ctx.stroke();
       }
 
+      const rawPlayers = (tick?.players ?? []).filter((p) => p.alive);
+      const meRaw = rawPlayers.find((p) => p.id === playerId);
+      const amIAlive = Boolean(meRaw);
+
       // Radar Echoes (periodic hero clues in fog/asymmetric modes)
-      if (tick?.echoes) {
+      if (
+        tick?.echoes &&
+        (myRole === 'hunter' || visibilityMode === 'fog_both' || !amIAlive)
+      ) {
         for (const ec of tick.echoes) {
           const ex = offsetX + ec.x * cellSize;
           const ey = offsetY + ec.y * cellSize;
@@ -480,8 +490,8 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         }
       }
 
-      // Tactical Hunter Pings
-      if (tick?.pings) {
+      // Tactical Hunter Pings (visible only to Guards and eliminated spectators)
+      if (tick?.pings && (myRole === 'hunter' || !amIAlive)) {
         for (const pg of tick.pings) {
           const px = offsetX + pg.x * cellSize;
           const py = offsetY + pg.y * cellSize;
@@ -505,8 +515,18 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
         }
       }
 
-      // Players
-      const players = (tick?.players ?? []).filter((p) => p.alive);
+      // Asymmetric visibility filtering
+      const players = rawPlayers.filter((p) => {
+        if (!amIAlive || !meRaw) return true;
+        if (phase === 'COUNTDOWN') return true;
+        if (p.id === playerId || p.role === myRole) return true;
+        if (visibilityMode === 'all_visible') return true;
+        if (visibilityMode === 'heroes_see_all' && myRole === 'hero') return true;
+        const radius =
+          myRole === 'hero' ? HERO_VISION_RADIUS : HUNTER_VISION_RADIUS;
+        return Math.hypot(p.x - meRaw.x, p.y - meRaw.y) <= radius;
+      });
+
       const activeIds = new Set(players.map((p) => p.id));
       for (const id of smoothedRef.current.keys()) {
         if (!activeIds.has(id)) smoothedRef.current.delete(id);
@@ -519,7 +539,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       });
 
       let mySmoothedPos: { x: number; y: number } | null = null;
-      let amIAlive = false;
 
       for (const p of sortedPlayers) {
         let sm = smoothedRef.current.get(p.id);
@@ -556,7 +575,6 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
 
         if (p.id === playerId) {
           mySmoothedPos = { x: sm.x, y: sm.y };
-          amIAlive = p.alive;
         }
 
         if (p.dashActive > 0 || p.speedBoost > 0) {
@@ -785,7 +803,7 @@ export const MazeCanvas: React.FC<MazeCanvasProps> = ({
       cancelAnimationFrame(animId);
       ro.disconnect();
     };
-  }, [maze, playerId, myRole, visibilityMode, liveTickRef, effectsRef]);
+  }, [maze, phase, playerId, myRole, visibilityMode, liveTickRef, effectsRef]);
 
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (myRole !== 'hunter') return;

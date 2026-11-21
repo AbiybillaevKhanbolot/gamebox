@@ -1,4 +1,3 @@
-import type { DataConnection } from 'peerjs';
 import type {
   ChatMessage,
   ClientMessage,
@@ -18,12 +17,16 @@ import type {
   TacticalPing,
 } from '../../shared/types.ts';
 import {
-  HERO_VISION_RADIUS,
-  HUNTER_VISION_RADIUS,
   MAX_PLAYERS_PER_ROOM,
   PLAYER_COLORS,
 } from '../../shared/types.ts';
 import { generateMaze } from './mazeGenerator.ts';
+
+export interface HostTransport {
+  onHostMessage: (msg: ServerMessage) => void;
+  onSendToClient: (clientId: string, msg: ServerMessage) => void;
+  onBroadcast: (msg: ServerMessage) => void;
+}
 
 interface InternalPlayer {
   id: string;
@@ -36,7 +39,7 @@ interface InternalPlayer {
   lives: number;
   maxLives: number;
   weaponCharges: number;
-  conn: DataConnection | null;
+  clientId: string | null;
   score: number;
   catches: number;
   escapes: number;
@@ -110,20 +113,22 @@ export class HostGameEngine {
   private lastResult: RoundResult | null = null;
   private chat: ChatMessage[] = [];
 
-  private connToPlayerId = new Map<DataConnection, string>();
-  private onHostMessage: (msg: ServerMessage) => void;
+  private clientToPlayerId = new Map<string, string>();
+  private transport: HostTransport;
   private tickInterval: ReturnType<typeof setInterval>;
   private pruneInterval: ReturnType<typeof setInterval>;
   private lastStepTime = performance.now();
+  private lastEmitTime = 0;
+  private pendingEvents: GameEvent[] = [];
 
   constructor(
     roomCode: string,
     hostName: string,
-    onHostMessage: (msg: ServerMessage) => void
+    transport: HostTransport
   ) {
     this.roomCode = roomCode;
     this.hostPlayerId = randomId(10);
-    this.onHostMessage = onHostMessage;
+    this.transport = transport;
 
     const hostPlayer: InternalPlayer = {
       id: this.hostPlayerId,
@@ -136,7 +141,7 @@ export class HostGameEngine {
       lives: 2,
       maxLives: 2,
       weaponCharges: 0,
-      conn: null,
+      clientId: null,
       score: 0,
       catches: 0,
       escapes: 0,
@@ -159,7 +164,7 @@ export class HostGameEngine {
     };
     this.players.push(hostPlayer);
 
-    this.onHostMessage({
+    this.transport.onHostMessage({
       type: 'joined',
       roomCode: this.roomCode,
       playerId: this.hostPlayerId,
@@ -179,7 +184,7 @@ export class HostGameEngine {
     this.pruneInterval = setInterval(() => {
       const now = Date.now();
       for (const p of [...this.players]) {
-        if (!p.isHost && p.connected && now - p.lastSeenAt > 10000) {
+        if (!p.isHost && p.connected && now - p.lastSeenAt > 12000) {
           this.handlePlayerDisconnect(p.id);
         }
       }
@@ -193,59 +198,28 @@ export class HostGameEngine {
       type: 'room_closed',
       message: 'Ведущий закрыл комнату',
     });
-    for (const p of this.players) {
-      if (p.conn) {
-        try {
-          p.conn.close();
-        } catch {
-          // ignore
-        }
-      }
-    }
-    this.connToPlayerId.clear();
-  }
-
-  public attachConnection(conn: DataConnection): void {
-    conn.on('data', (raw) => {
-      try {
-        const msg = (typeof raw === 'string' ? JSON.parse(raw) : raw) as ClientMessage;
-        this.handleRemoteMessage(conn, msg);
-      } catch {
-        this.sendToConn(conn, { type: 'error', message: 'Некорректное сообщение' });
-      }
-    });
-
-    conn.on('close', () => {
-      const pid = this.connToPlayerId.get(conn);
-      this.connToPlayerId.delete(conn);
-      if (pid) {
-        this.handlePlayerDisconnect(pid);
-      }
-    });
-
-    conn.on('error', () => {
-      const pid = this.connToPlayerId.get(conn);
-      this.connToPlayerId.delete(conn);
-      if (pid) {
-        this.handlePlayerDisconnect(pid);
-      }
-    });
+    this.clientToPlayerId.clear();
   }
 
   public handleHostAction(msg: ClientMessage): void {
     this.processPlayerAction(this.hostPlayerId, msg);
   }
 
-  private handleRemoteMessage(conn: DataConnection, msg: ClientMessage): void {
+  public handleRemoteMessage(clientId: string, msg: ClientMessage): void {
     if (msg.type === 'join_room') {
-      this.handleRemoteJoin(conn, msg);
+      this.handleRemoteJoin(clientId, msg);
       return;
     }
 
-    const pid = this.connToPlayerId.get(conn);
+    const pid = this.clientToPlayerId.get(clientId);
     if (!pid) return;
     const player = this.players.find((p) => p.id === pid);
     if (!player) return;
+
+    if (msg.type === 'leave_room') {
+      this.handleClientDisconnect(clientId);
+      return;
+    }
 
     player.lastSeenAt = Date.now();
     if (msg.type === 'heartbeat') return;
@@ -253,25 +227,42 @@ export class HostGameEngine {
     this.processPlayerAction(pid, msg);
   }
 
+  public handleClientDisconnect(clientId: string): void {
+    const pid = this.clientToPlayerId.get(clientId);
+    this.clientToPlayerId.delete(clientId);
+    if (pid) {
+      this.handlePlayerDisconnect(pid);
+    }
+  }
+
   private handleRemoteJoin(
-    conn: DataConnection,
+    clientId: string,
     msg: Extract<ClientMessage, { type: 'join_room' }>
   ): void {
     const cleanName = String(msg.name || '').trim().slice(0, 18);
     if (!cleanName) {
-      this.sendToConn(conn, { type: 'error', message: 'Введите ваше имя' });
+      this.transport.onSendToClient(clientId, {
+        type: 'error',
+        message: 'Введите ваше имя',
+      });
       return;
     }
 
-    if (msg.playerId) {
-      const existing = this.players.find((p) => p.id === msg.playerId);
+    // Reconnect by existing playerId or same clientId
+    const existingByClientId = this.clientToPlayerId.get(clientId);
+    const reconnectTargetId = msg.playerId || existingByClientId;
+    if (reconnectTargetId) {
+      const existing = this.players.find((p) => p.id === reconnectTargetId);
       if (existing && !existing.isHost) {
-        existing.conn = conn;
+        if (existing.clientId && existing.clientId !== clientId) {
+          this.clientToPlayerId.delete(existing.clientId);
+        }
+        existing.clientId = clientId;
         existing.connected = true;
         existing.name = cleanName;
         existing.lastSeenAt = Date.now();
-        this.connToPlayerId.set(conn, existing.id);
-        this.sendToConn(conn, {
+        this.clientToPlayerId.set(clientId, existing.id);
+        this.transport.onSendToClient(clientId, {
           type: 'joined',
           roomCode: this.roomCode,
           playerId: existing.id,
@@ -284,7 +275,7 @@ export class HostGameEngine {
 
     const activeCount = this.players.filter((p) => p.connected).length;
     if (activeCount >= MAX_PLAYERS_PER_ROOM) {
-      this.sendToConn(conn, {
+      this.transport.onSendToClient(clientId, {
         type: 'error',
         message: `Комната заполнена (максимум ${MAX_PLAYERS_PER_ROOM} игроков)`,
       });
@@ -312,7 +303,7 @@ export class HostGameEngine {
       lives: 1,
       maxLives: 1,
       weaponCharges: 0,
-      conn,
+      clientId,
       score: 0,
       catches: 0,
       escapes: 0,
@@ -335,9 +326,9 @@ export class HostGameEngine {
     };
 
     this.players.push(newPlayer);
-    this.connToPlayerId.set(conn, newPlayer.id);
+    this.clientToPlayerId.set(clientId, newPlayer.id);
 
-    this.sendToConn(conn, {
+    this.transport.onSendToClient(clientId, {
       type: 'joined',
       roomCode: this.roomCode,
       playerId: newPlayer.id,
@@ -352,9 +343,12 @@ export class HostGameEngine {
     const player = this.players.find((p) => p.id === playerId);
     if (!player || !player.connected) return;
 
+    if (player.clientId) {
+      this.clientToPlayerId.delete(player.clientId);
+      player.clientId = null;
+    }
     player.connected = false;
     player.alive = false;
-    player.conn = null;
     player.inputDx = 0;
     player.inputDy = 0;
 
@@ -429,7 +423,7 @@ export class HostGameEngine {
         if (this.phase !== 'LOBBY' && this.phase !== 'ROUND_SUMMARY') return;
         const connectedPlayers = this.players.filter((p) => p.connected);
         if (connectedPlayers.length < 2) {
-          this.onHostMessage({
+          this.transport.onHostMessage({
             type: 'error',
             message: 'Для начала нужно минимум 2 игрока',
           });
@@ -543,7 +537,6 @@ export class HostGameEngine {
       this.heroRotationIndex = (this.heroRotationIndex + desiredHeroes) % connected.length;
     }
 
-    // Fill missing slots if host_pick had fewer selections than desired
     while (chosenHeroes.length < desiredHeroes) {
       const next = connected.find(
         (p) => !chosenHeroes.some((h) => h.id === p.id)
@@ -613,8 +606,10 @@ export class HostGameEngine {
     this.echoes = [];
     this.lastResult = null;
     this.pickupSpawnTimer = 6.5;
-    this.weaponSpawnTimer = 11.0; // first rare weapon coin appears after 11s
+    this.weaponSpawnTimer = 11.0;
     this.echoTimer = 9.0;
+    this.pendingEvents = [];
+    this.lastEmitTime = 0;
     this.pickups = this.spawnInitialPickups(maze);
     this.lastStepTime = performance.now();
 
@@ -704,7 +699,6 @@ export class HostGameEngine {
     this.pings = this.pings.filter((pg) => pg.expiresAt > now);
     this.echoes = this.echoes.filter((ec) => ec.expiresAt > now);
 
-    // Periodic Radar Echo in asymmetric / fog modes so large maze never turns into blind wandering
     if (this.settings.visibilityMode !== 'all_visible') {
       this.echoTimer -= dt;
       if (this.echoTimer <= 0) {
@@ -723,7 +717,6 @@ export class HostGameEngine {
       }
     }
 
-    // Standard pickups respawn
     this.pickupSpawnTimer -= dt;
     if (this.pickupSpawnTimer <= 0) {
       this.pickupSpawnTimer = 10.5;
@@ -743,7 +736,6 @@ export class HostGameEngine {
       }
     }
 
-    // Rare weapon coin spawn (max 1 on map at a time, spawns every ~22s)
     const hasWeaponCoin = this.pickups.some((p) => p.type === 'weapon');
     if (!hasWeaponCoin) {
       this.weaponSpawnTimer -= dt;
@@ -761,7 +753,6 @@ export class HostGameEngine {
       }
     }
 
-    // Move players
     for (const p of this.players) {
       if (!p.connected || !p.alive) continue;
 
@@ -797,7 +788,6 @@ export class HostGameEngine {
         }
       }
 
-      // Active sword strike if Hero presses E / attack button near a guard
       if (p.attackQueued) {
         p.attackQueued = false;
         if (p.role === 'hero' && p.weaponCharges > 0) {
@@ -861,7 +851,6 @@ export class HostGameEngine {
       return;
     }
 
-    // Check pickups
     for (let i = this.pickups.length - 1; i >= 0; i--) {
       const item = this.pickups[i];
       for (const p of this.players) {
@@ -896,7 +885,6 @@ export class HostGameEngine {
       }
     }
 
-    // Check any alive Hero reaching Exit
     for (const hero of aliveHeroes) {
       if (Math.hypot(hero.x - maze.exitPos.x, hero.y - maze.exitPos.y) < 0.52) {
         this.finishRound('hero', 'escaped', undefined, hero);
@@ -904,7 +892,6 @@ export class HostGameEngine {
       }
     }
 
-    // Check Hero vs Hunter collisions
     if (this.huntersReleaseIn <= 0) {
       for (const hero of aliveHeroes) {
         for (const hunter of this.players) {
@@ -913,7 +900,6 @@ export class HostGameEngine {
           }
           const dist = Math.hypot(hunter.x - hero.x, hunter.y - hero.y);
 
-          // If Hero holds weapon charge, touching a Guard eliminates the Guard!
           if (hero.weaponCharges > 0 && dist < 0.62) {
             this.slayGuard(hero, hunter, events);
             const remainingGuards = this.players.filter(
@@ -1019,32 +1005,6 @@ export class HostGameEngine {
     }
   }
 
-  private isPlayerVisibleTo(
-    target: InternalPlayer,
-    viewer: InternalPlayer
-  ): boolean {
-    if (!target.alive) return false;
-    if (!viewer.alive) return true; // Eliminated spectators can see everyone
-    if (this.phase === 'COUNTDOWN') return true;
-    if (target.id === viewer.id) return true;
-    if (target.role === viewer.role) return true; // Teammates always see each other
-
-    if (this.settings.visibilityMode === 'all_visible') return true;
-
-    if (this.settings.visibilityMode === 'heroes_see_all') {
-      if (viewer.role === 'hero') return true;
-      return (
-        Math.hypot(target.x - viewer.x, target.y - viewer.y) <=
-        HUNTER_VISION_RADIUS
-      );
-    }
-
-    // 'fog_both'
-    const radius =
-      viewer.role === 'hero' ? HERO_VISION_RADIUS : HUNTER_VISION_RADIUS;
-    return Math.hypot(target.x - viewer.x, target.y - viewer.y) <= radius;
-  }
-
   private toTickState(p: InternalPlayer): PlayerTickState {
     return {
       id: p.id,
@@ -1070,33 +1030,34 @@ export class HostGameEngine {
   }
 
   private emitTick(events: GameEvent[]): void {
-    const connected = this.players.filter((p) => p.connected);
-    const now = Date.now();
-
-    for (const viewer of connected) {
-      const visiblePlayers = connected
-        .filter((target) => this.isPlayerVisibleTo(target, viewer))
-        .map((target) => this.toTickState(target));
-
-      const payload: ServerMessage = {
-        type: 'tick',
-        t: now,
-        timeLeft: Math.round(this.timeLeft * 10) / 10,
-        countdown: Math.round(this.countdown * 10) / 10,
-        huntersReleaseIn: Math.round(this.huntersReleaseIn * 10) / 10,
-        players: visiblePlayers,
-        pickups: this.pickups,
-        pings: viewer.role === 'hunter' || !viewer.alive ? this.pings : [],
-        echoes: viewer.role === 'hunter' || this.settings.visibilityMode === 'fog_both' ? this.echoes : [],
-        events,
-      };
-
-      if (viewer.isHost) {
-        this.onHostMessage(payload);
-      } else if (viewer.conn && viewer.conn.open) {
-        viewer.conn.send(payload);
-      }
+    if (events.length > 0) {
+      this.pendingEvents.push(...events);
     }
+    const nowPerf = performance.now();
+    // Broadcast over MQTT at ~20 Hz (50ms) unless urgent game events just fired
+    if (this.pendingEvents.length === 0 && nowPerf - this.lastEmitTime < 48) {
+      return;
+    }
+    this.lastEmitTime = nowPerf;
+    const flushedEvents = this.pendingEvents;
+    this.pendingEvents = [];
+
+    const connectedAlive = this.players.filter((p) => p.connected && p.alive);
+    const payload: ServerMessage = {
+      type: 'tick',
+      t: Date.now(),
+      timeLeft: Math.round(this.timeLeft * 10) / 10,
+      countdown: Math.round(this.countdown * 10) / 10,
+      huntersReleaseIn: Math.round(this.huntersReleaseIn * 10) / 10,
+      players: connectedAlive.map((p) => this.toTickState(p)),
+      pickups: this.pickups,
+      pings: this.pings,
+      echoes: this.echoes,
+      events: flushedEvents,
+    };
+
+    this.transport.onHostMessage(payload);
+    this.transport.onBroadcast(payload);
   }
 
   private finishRound(
@@ -1183,24 +1144,9 @@ export class HostGameEngine {
     this.broadcast({ type: 'chat_message', msg });
   }
 
-  private sendToConn(conn: DataConnection | null, payload: ServerMessage): void {
-    if (!conn) return;
-    if (conn.open) {
-      conn.send(payload);
-    } else {
-      conn.once('open', () => {
-        if (conn.open) conn.send(payload);
-      });
-    }
-  }
-
   private broadcast(payload: ServerMessage): void {
-    this.onHostMessage(payload);
-    for (const p of this.players) {
-      if (!p.isHost && p.connected && p.conn && p.conn.open) {
-        p.conn.send(payload);
-      }
-    }
+    this.transport.onHostMessage(payload);
+    this.transport.onBroadcast(payload);
   }
 
   private broadcastRoomState(): void {
