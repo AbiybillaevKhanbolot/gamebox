@@ -36,23 +36,50 @@ export interface VisualEffect {
 
 const PEER_PREFIX = 'maze-escape-office-';
 
+// Include both public STUN servers AND PeerJS's default TURN relay servers
+// so WebRTC works reliably across different Wi-Fi/NAT/mobile networks.
 const PEER_CONFIG = {
   config: {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      {
+        urls: [
+          'turn:eu-0.turn.peerjs.com:3478',
+          'turn:us-0.turn.peerjs.com:3478',
+        ],
+        username: 'peerjs',
+        credential: 'peerjsp',
+      },
     ],
   },
 };
 
 function generateShortCode(): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 4; i++) {
-    code += alphabet[Math.floor(Math.random() * alphabet.length)];
-  }
-  return code;
+  // 5-digit numeric code works identically on RU and EN keyboard layouts
+  return String(10000 + Math.floor(Math.random() * 90000));
+}
+
+export function normalizeRoomCode(raw: string): string {
+  const map: Record<string, string> = {
+    А: 'A',
+    В: 'B',
+    Е: 'E',
+    К: 'K',
+    М: 'M',
+    Н: 'H',
+    О: 'O',
+    Р: 'P',
+    С: 'C',
+    Т: 'T',
+    Х: 'X',
+  };
+  return raw
+    .trim()
+    .toUpperCase()
+    .replace(/[АВЕКМНОРСТХ]/g, (ch) => map[ch] || ch)
+    .replace(/\s+/g, '');
 }
 
 export function useGameSocket() {
@@ -319,8 +346,21 @@ export function useGameSocket() {
         peer.on('open', () => {
           setConnecting(false);
           setConnected(true);
-          const engine = new HostGameEngine(code, cleanName, handleServerMessage);
-          hostEngineRef.current = engine;
+          if (!hostEngineRef.current) {
+            const engine = new HostGameEngine(code, cleanName, handleServerMessage);
+            hostEngineRef.current = engine;
+          }
+        });
+
+        peer.on('disconnected', () => {
+          // Keep host registered on signaling server so new players can still join
+          if (!peer.destroyed) {
+            try {
+              peer.reconnect();
+            } catch {
+              // ignore
+            }
+          }
         });
 
         peer.on('connection', (conn) => {
@@ -342,8 +382,10 @@ export function useGameSocket() {
             tryCreate();
             return;
           }
+          // Ignore transient signaling errors after room is already active
+          if (hostEngineRef.current) return;
           setConnecting(false);
-          setError('Не удалось создать P2P-комнату. Попробуйте ещё раз.');
+          setError('Не удалось создать комнату. Проверьте доступ к сети и попробуйте ещё раз.');
         });
       };
 
@@ -355,7 +397,7 @@ export function useGameSocket() {
   const joinRoom = useCallback(
     (rawCode: string, name: string) => {
       const cleanName = name.trim().slice(0, 18);
-      const code = rawCode.trim().toUpperCase();
+      const code = normalizeRoomCode(rawCode);
       if (!cleanName) {
         setError('Введите ваше имя');
         return;
@@ -375,27 +417,38 @@ export function useGameSocket() {
       connectTimeoutRef.current = setTimeout(() => {
         cleanupNetwork();
         setError(
-          `Комната «${code}» не отвечает. Проверьте код или убедитесь, что ведущий не закрыл вкладку.`
+          `Не удалось установить P2P-соединение с комнатой «${code}». Если вы в корпоративном VPN/файрволе, попробуйте открыть игру без VPN или с одной сети.`
         );
-      }, 11000);
+      }, 18000);
 
       peer.on('open', () => {
-        const conn = peer.connect(`${PEER_PREFIX}${code}`, { reliable: true });
+        const conn = peer.connect(`${PEER_PREFIX}${code}`, {
+          reliable: true,
+          serialization: 'json',
+        });
         clientConnRef.current = conn;
 
-        conn.on('open', () => {
+        const sendJoin = () => {
           conn.send({
             type: 'join_room',
             roomCode: code,
             name: cleanName,
           } satisfies ClientMessage);
 
-          heartbeatRef.current = setInterval(() => {
-            if (conn.open) {
-              conn.send({ type: 'heartbeat' } satisfies ClientMessage);
-            }
-          }, 2500);
-        });
+          if (!heartbeatRef.current) {
+            heartbeatRef.current = setInterval(() => {
+              if (conn.open) {
+                conn.send({ type: 'heartbeat' } satisfies ClientMessage);
+              }
+            }, 2500);
+          }
+        };
+
+        if (conn.open) {
+          sendJoin();
+        } else {
+          conn.on('open', sendJoin);
+        }
 
         conn.on('data', (raw) => {
           try {
@@ -428,7 +481,7 @@ export function useGameSocket() {
       peer.on('error', (err) => {
         cleanupNetwork();
         if (err.type === 'peer-unavailable') {
-          setError(`Комната «${code}» не найдена`);
+          setError(`Комната «${code}» не найдена. Проверьте код или убедитесь, что ведущий не закрыл вкладку.`);
         } else {
           setError('Ошибка WebRTC-подключения. Попробуйте ещё раз.');
         }

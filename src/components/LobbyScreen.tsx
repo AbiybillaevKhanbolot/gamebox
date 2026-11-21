@@ -178,7 +178,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                             setJoinCode(e.target.value.toUpperCase());
                             onClearError();
                           }}
-                          placeholder="ABCD"
+                          placeholder="48291"
                           className="w-full px-4 py-3 rounded-lg bg-white border-2 border-[#162328] text-[#162328] font-mono text-lg font-bold tracking-widest uppercase placeholder-[#94A3B8] focus:outline-none focus:bg-[#FFFBEB]"
                         />
                       </div>
@@ -232,7 +232,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                               setJoinCode(e.target.value.toUpperCase());
                               onClearError();
                             }}
-                            placeholder="K7M2"
+                            placeholder="48291"
                             className="flex-1 min-w-0 px-4 py-2.5 rounded-lg bg-white border-2 border-[#162328] text-[#162328] font-mono font-bold tracking-wider uppercase placeholder-[#94A3B8] focus:outline-none focus:bg-[#FFFBEB]"
                           />
                           <button

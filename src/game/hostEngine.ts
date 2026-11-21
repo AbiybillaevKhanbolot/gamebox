@@ -1184,8 +1184,13 @@ export class HostGameEngine {
   }
 
   private sendToConn(conn: DataConnection | null, payload: ServerMessage): void {
-    if (conn && conn.open) {
+    if (!conn) return;
+    if (conn.open) {
       conn.send(payload);
+    } else {
+      conn.once('open', () => {
+        if (conn.open) conn.send(payload);
+      });
     }
   }
 
